@@ -1,0 +1,4 @@
+- [x] Cover working-tree scope, directory refusal and the extended shell-write classifier as pure functions.
+- [x] Cover lease loss under a veto, exclusivity without a record, unreadable discovery, phantom pending claims, notice on failed commands, heartbeat idle cleanup and plugin unload at the plugin boundary.
+- [x] Cover managed mode with an unreachable Docker socket.
+- [x] Re-run the unit, managed and packed acceptance suites.

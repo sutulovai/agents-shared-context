@@ -1,0 +1,31 @@
+name: Verify plugin
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+      - run: npm run check:public
+      - run: npm test
+      - run: npm run test:managed
+      - run: npm install --global @opencode/cli@2.3.2
+      - run: npm run test:acceptance
+      - run: npm run test:acceptance
+        env:
+          ASC_INSTALL: global-managed
