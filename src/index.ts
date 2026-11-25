@@ -131,8 +131,8 @@ export default {
       if (r.status === "read-only") return `Read-only: ${holder} requested exclusive access. ${r.reason ?? ""}`;
       if (r.status === "conflict") return `Conflict: ${shown} is held by ${holder}.`;
       if (r.status === "occupied")
-        return "Another plugin instance still owns this session's lease. Wait for expiry or close the other instance.";
-      if (r.status === "waiting") return "Another session is active. Choose /coord-wait or /coord-parallel.";
+        return "Another plugin instance owns this session's lease. Wait for expiry or close it.";
+      if (r.status === "waiting") return `Another session is active: ${r.label ?? r.owner ?? "another session"}. Join it (/coord-wait) or work in parallel (/coord-parallel)?`;
       return `Reservation not granted: ${r.status}. Retry after checking coord_who.`;
     }
     async function reserve(id: ID, m: Member, paths: string[], call?: string, expected = m.veto?.request) {
@@ -294,7 +294,7 @@ export default {
         if (incomplete && event.source?.type === "tool")
           m.notices.set(
             `${event.source.messageID}:${event.source.id}`,
-            "Some paths could not be resolved inside this checkout and are not coordinated.",
+            "Some paths are outside this checkout and not coordinated.",
           );
         if (!paths.length) return;
         const call = event.source?.type === "tool" ? `${event.source.messageID}:${event.source.id}` : undefined;
@@ -362,8 +362,7 @@ export default {
             // A model that distrusts a quiet command reruns it; the rerun must ask for protection again.
             m.notices.set(
               call,
-              "Stable-source protection ended with this command. Other sessions may edit again. " +
-                "Call coord_exclusive again before another build that needs unchanged sources.",
+              "Stable-source protection ended. Other sessions may edit again. Call coord_exclusive before the next protected build.",
             );
           }
         } catch {
@@ -377,8 +376,7 @@ export default {
         m.shellNoticed = true;
         m.notices.set(
           call,
-          "This shell command may write files. Shell writes are not coordinated: other sessions cannot see them. " +
-            "Use the edit tools, or call coord_claim with the affected paths before writing.",
+          "Shell writes are not coordinated; other sessions cannot see them. Use edit tools, or coord_claim first.",
         );
       }
       const notice = [m.notices.get(call), m.warning].filter(Boolean).join("\n");

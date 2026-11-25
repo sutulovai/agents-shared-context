@@ -305,7 +305,7 @@ test("a finished stable build tells its session that source protection ended", a
   await hooks.get("execute.before")(shell);
   const event = { ...shell, status: "completed", result: { content: "ok" } };
   await hooks.get("execute.after")(event);
-  assert.match(event.result.content, /protection ended with this command/i);
+  assert.match(event.result.content, /protection ended/i);
   assert.doesNotMatch((await invoke(tools, "coord_who", "parent")).content, /"policy"/);
 });
 
