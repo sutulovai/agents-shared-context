@@ -1,0 +1,3 @@
+- [x] Test concurrent admission, drain, cancellation, ownership and expiry against Redis.
+- [x] Wire the veto into session admission, edit and foreground shell execution.
+- [x] Verify the packaged plugin in independent sessions and update public usage.

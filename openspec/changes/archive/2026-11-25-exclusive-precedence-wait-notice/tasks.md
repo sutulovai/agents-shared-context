@@ -1,0 +1,4 @@
+- [x] Cover exclusive precedence, the read-only probe and the notice classifier against Redis and as pure functions.
+- [x] Cover `coord_wait` blocking, cancellation and the shell notice at the plugin boundary.
+- [x] Re-run the packed acceptance suite after the change.
+- [x] Confirm with live-model sessions: conflict, waiting and stable build.
