@@ -32,6 +32,7 @@ Rules live in Lua when two sessions can race for them. Rules live in TypeScript 
 - **Memory defers to Redis.** A veto, membership or claim that Redis no longer holds is gone. The next operation rejoins from ordinary admission instead of refusing with `lost`.
 - **No phantom in-flight work.** A finished tool call whose provisional claim was not acknowledged is settled on the next successful operation, or every exclusivity request stays pending.
 - **Text from other sessions is data.** Titles and reasons are written by other agents and reach this session's model. The system text tells the model to treat them as information.
+- **Notices are one sentence.** A denial or warning names the peer by label, never by session ID, and states the choice or fix once. The owner rejected multi-sentence coordination prompts as machine-facing noise.
 
 ## Order of a change
 
@@ -89,6 +90,7 @@ Working in the repository as an agent:
 - A review by the author misses the author's assumptions. The inverted flag, the port-1 assumption and the `PWD` problem were each found by looking at evidence from outside the code: a config file, a container list, a `redis-cli MONITOR` log.
 - Tool slips that cost a round each: an edit that inserted a literal `+` line into a YAML file; a shell redirect placed before the directory it writes into exists; a `mkdir -p` that stopped one level short. Re-read the file after a mechanical edit.
 - `openspec new change` can report "already exists" after creating the directory. Write the artifacts into the directory it names and check the result after archiving.
+- Changing a plugin default broke a unit assertion that encoded the old mode's semantics (an observer got patch tools only under `join: "ask"`). When changing a default, grep test assertions that branch on the mode, not only README and message strings.
 - A skill that quotes a forbidden literal, such as a home-directory prefix, fails the public-tree scan. Describe patterns in words.
 
 ## Packaging and the public repository

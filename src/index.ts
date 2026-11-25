@@ -132,7 +132,8 @@ export default {
       if (r.status === "conflict") return `Conflict: ${shown} is held by ${holder}.`;
       if (r.status === "occupied")
         return "Another plugin instance owns this session's lease. Wait for expiry or close it.";
-      if (r.status === "waiting") return `Another session is active: ${r.label ?? r.owner ?? "another session"}. Join it (/coord-wait) or work in parallel (/coord-parallel)?`;
+      if (r.status === "waiting")
+        return `Another session is active: ${r.label ?? r.owner ?? "another session"}. Join it (/coord-wait) or work in parallel (/coord-parallel)?`;
       return `Reservation not granted: ${r.status}. Retry after checking coord_who.`;
     }
     async function reserve(id: ID, m: Member, paths: string[], call?: string, expected = m.veto?.request) {
