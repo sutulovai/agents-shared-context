@@ -35,7 +35,7 @@ export default {
     if (typeof port !== "number") throw new Error("Expected a numeric Redis port");
     const managed = ctx.options.managed ?? false;
     if (typeof managed !== "boolean") throw new Error("Expected a boolean managed option");
-    const join = ctx.options.join ?? "ask";
+    const join = ctx.options.join ?? "parallel";
     if (join !== "ask" && join !== "parallel") throw new Error("Expected join: ask or parallel");
     const seconds = ctx.options.leaseSeconds ?? 600;
     if (typeof seconds !== "number" || !Number.isInteger(seconds) || seconds < 10 || seconds > 86400) {

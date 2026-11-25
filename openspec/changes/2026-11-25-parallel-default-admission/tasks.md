@@ -1,0 +1,3 @@
+- [x] Test that a top-level newcomer joins in parallel by default and still hits per-file conflicts.
+- [x] Wire the default (`join ?? "parallel"`) and keep `join: "ask"` working.
+- [x] Update the README admission and configuration wording.

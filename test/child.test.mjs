@@ -120,7 +120,7 @@ test("a child runs without another join prompt but cannot take its parent's rese
   await hooks.get("evaluate")(edit);
   assert.equal(edit.effect, "ask", "Coordination must not promote an existing approval prompt to allow");
   const observer = await turn("observer");
-  assert.equal(observer.tools.patch, undefined);
+  assert.ok(observer.tools.patch, "Default parallel admission leaves edit tools available");
   assert.ok(observer.tools.coord_who);
 });
 
@@ -353,4 +353,17 @@ test("the heartbeat ends an idle session, and plugin cleanup removes every membe
   );
   await cleanup();
   assert.deepEqual(await who(), [], "Plugin unload left members behind");
+});
+
+test("a top-level newcomer joins an active project in parallel by default", async (t) => {
+  const { tools, turn, directory } = await fixture(t);
+  await turn("parent");
+  await turn("peer");
+  const held = await invoke(tools, "coord_claim", "parent", { paths: ["owned.txt"] });
+  assert.match(held.content, /Reserved/);
+  const disjoint = await invoke(tools, "coord_claim", "peer", { paths: ["other.txt"] });
+  assert.match(disjoint.content, /Reserved/, "Default admission asked instead of joining in parallel");
+  const conflict = await invoke(tools, "coord_claim", "peer", { paths: ["owned.txt"] });
+  assert.match(conflict.content, /Conflict/);
+  await rm(directory, { recursive: true, force: true });
 });
