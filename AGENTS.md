@@ -33,7 +33,7 @@ openspec validate --all --strict
 - Before a commit, review the change twice on the same files and merge the findings: OCR in delegation mode (`ocr delegate preview`, then `ocr delegate rule`), then the `ponytail-review` skill. The steps are in skill `asc-development`.
 - Never commit or push unless the user asks in this conversation. Report the branch and offer.
 - Do not start live-model runs or subagents without the user's choice of model.
-- The target machine is macOS. Linux belongs to CI. Say which platform a result was observed on.
+- Verify on the user's own machine (macOS) by default. Run checks in a Linux container only when the change is Linux-specific, when CI failed on Linux, or when the user asks. Say which platform a result was observed on.
 - Leave no Docker containers, no OpenCode sessions and no temporary directories behind. Check `docker ps -a` for `agents-shared-context-*` after the managed tests and after any subagent that ran tests.
 - No absolute paths, internal hostnames or credentials in any tracked file. Do not quote a forbidden literal in prose either; describe it in words.
 

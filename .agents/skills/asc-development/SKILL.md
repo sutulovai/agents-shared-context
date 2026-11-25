@@ -104,4 +104,4 @@ The package is public and pinned to one OpenCode version.
 
 ## Platform
 
-The owner runs macOS. Do not spend a run on Linux containers unless asked. Linux belongs to CI.
+The owner runs macOS, and that is where results count. Run checks in a Linux container only when the change is Linux-specific, when CI failed on Linux, or when the owner asks. One such run cost an hour and proved nothing: it replaced `node_modules` with Linux binaries and had to be redone on macOS. Say which platform a result was observed on.
