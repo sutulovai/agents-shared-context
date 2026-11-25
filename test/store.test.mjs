@@ -68,6 +68,54 @@ test("only one simultaneous arrival starts; waiters do not keep each other waiti
   await run("leave", waiter);
 });
 
+test("project probes ignore waiting peers and observe active peers without paths", async () => {
+  const guest = { id: "session-c", token: "third", label: "Another waiter" };
+  assert.equal((await run("parallel", a)).status, "active");
+  assert.equal((await run("join", b)).status, "waiting");
+  assert.equal((await run("join", guest)).status, "waiting");
+  assert.equal((await run("project-probe", b)).owner, a.id);
+  await run("leave", a);
+  assert.equal((await run("project-probe", b)).status, "ok");
+  assert.equal((await run("project-probe", guest)).status, "ok");
+  await Promise.all([b, guest].map((owner) => run("leave", owner)));
+});
+
+test("project-wait markers never hide file claims, in-flight work, or resumed sessions", async () => {
+  await run("parallel", a);
+  await run("parallel", b);
+  await run("claim", b, ["held"]);
+  assert.equal((await run("project-probe", b)).status, "waiting");
+  assert.equal((await run("claim", a, ["held"])).status, "conflict");
+  assert.equal((await call("stage", b, "edit", ["busy"])).status, "acquired");
+  assert.equal((await run("project-probe", b)).status, "waiting");
+  assert.equal((await run("project-probe", a)).owner, b.id);
+  await call("finish", b, "edit");
+  await run("project-unwait", b);
+  assert.equal((await run("project-probe", a)).owner, b.id);
+  await Promise.all([a, b].map((owner) => run("leave", owner)));
+});
+
+test("a project wait cannot bypass a waiting peer's veto", async () => {
+  await run("parallel", a);
+  await run("parallel", b);
+  assert.equal((await run("project-probe", a)).status, "waiting");
+  assert.equal((await veto(a)).status, "exclusive");
+  assert.equal((await run("project-probe", b)).status, "read-only");
+  await call("share", a, "request");
+  await Promise.all([a, b].map((owner) => run("leave", owner)));
+});
+
+test("an old wait cannot clear a newer project's wait marker", async () => {
+  await run("parallel", a);
+  await run("parallel", b);
+  await call("project-probe", b, "old");
+  await call("project-probe", b, "new");
+  await call("project-unwait", b, "old");
+  assert.equal(JSON.parse(await redis.hget(key, b.id)).projectWaitRequest, "new");
+  await call("project-unwait", b, "new");
+  await Promise.all([a, b].map((owner) => run("leave", owner)));
+});
+
 test("an incumbent drains in-flight work; neither a peer nor a newcomer can override its veto", async () => {
   const guest = { ...b, id: "guest" };
   await run("parallel", a);

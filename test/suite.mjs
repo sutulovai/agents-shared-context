@@ -36,7 +36,7 @@ try {
     stdio: "inherit",
   });
   // Outage scenarios inject their own port and cannot run against the managed global install.
-  const unmanagedOnly = new Set(["outage", "recover", "deny"]);
+  const unmanagedOnly = new Set(["outage", "recover", "deny", "lost-grant", "ambiguous-deny"]);
   for (const scenario of [
     "patch",
     "nested",
@@ -44,10 +44,13 @@ try {
     "rollback",
     "join-parallel",
     "join-wait",
+    "join-default-wait",
     "join-cancel",
     "build",
     "veto",
     "failed-build",
+    "lost-grant",
+    "ambiguous-deny",
     "outage",
     "recover",
     "deny",

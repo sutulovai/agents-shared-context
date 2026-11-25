@@ -23,12 +23,15 @@ export type Operation =
   | "claim"
   | "stage"
   | "probe"
+  | "project-probe"
+  | "project-unwait"
   | "finish"
   | "abandon"
   | "renew"
   | "leave"
   | "exclusive"
   | "share"
+  | "veto"
   | "who";
 export interface Reply {
   status:
@@ -70,8 +73,25 @@ if op=='renew' then
   redis.call('HPEXPIRE',key,ttl,'FIELDS',1,id)
   return answer('ok')
 end
+if op=='veto' then
+  if self and self.policy and self.policy.request==ARGV[6] then return answer('ok') end
+  return answer('lost')
+end
 if not self and op~='join' and op~='parallel' and op~='who' then return answer('lost') end
 if not self and op~='who' and redis.call('HLEN',key)>=128 then return answer('full') end
+if op=='project-unwait' then
+  if self.projectWaitRequest and self.projectWaitRequest~=ARGV[6] then return answer('ok') end
+  self.projectWaitUntil=nil
+  self.projectWaitRequest=nil
+  redis.call('HSET',key,id,cjson.encode(self))
+  redis.call('HPEXPIRE',key,ttl,'FIELDS',1,id)
+  return answer('ok')
+end
+if self and self.projectWaitUntil and (op=='parallel' or op=='claim' or op=='stage' or op=='exclusive') then
+  self.projectWaitUntil=nil
+  self.projectWaitRequest=nil
+  redis.call('HSET',key,id,cjson.encode(self))
+end
 local paths={}
 local call=ARGV[6]
 for i=10,#ARGV do paths[ARGV[i]]=true end
@@ -79,13 +99,21 @@ for i=10,#ARGV do paths[ARGV[i]]=true end
 local override=self and self.policy and self.policy.phase=='exclusive' and self.policy.mode=='work'
 local peers={}
 local gate, gateOwner, gateLabel, draining
-if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' or op=='stage' or op=='probe' then
+local now=0
+if op=='project-probe' then
+  local time=redis.call('TIME')
+  now=tonumber(time[1])*1000+math.floor(tonumber(time[2])/1000)
+end
+if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' or op=='stage' or op=='probe' or op=='project-probe' then
   local rows=redis.call('HGETALL',key)
   for i=1,#rows,2 do
     local p=cjson.decode(rows[i+1])
     if p.policy then gate=p.policy; gateOwner=rows[i]; gateLabel=p.label end
     if op=='exclusive' and (next(p.pending) or (p.kept['build:checkout'] and not (rows[i]==id and p.policy and p.policy.phase=='exclusive'))) then draining=rows[i] end
     if op=='who' or (rows[i]~=id and p.state=='active') then
+      if op=='project-probe' and (not p.projectWaitUntil or p.projectWaitUntil<=now or next(p.pending)) then
+        table.insert(peers,{id=rows[i],label=p.label})
+      end
       if op=='claim' or op=='stage' or op=='probe' then
         for _,f in ipairs(p.paths) do
           if paths[f] and not override then return answer('conflict',nil,rows[i],f,nil,p.label) end
@@ -102,6 +130,16 @@ if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' o
   end
 end
 if op=='who' then return answer('ok',peers) end
+if op=='project-probe' then
+  local blocked=(gate and gateOwner~=id) or #peers>0
+  self.projectWaitUntil=blocked and now+4000 or nil
+  self.projectWaitRequest=blocked and call or nil
+  redis.call('HSET',key,id,cjson.encode(self))
+  redis.call('HPEXPIRE',key,ttl,'FIELDS',1,id)
+  if gate and gateOwner~=id then return answer('read-only',nil,gateOwner,nil,nil,gateLabel) end
+  if #peers>0 then return answer('waiting',nil,peers[1].id,nil,nil,peers[1].label) end
+  return answer('ok')
+end
 if op=='probe' then
   if not self or self.state~='active' then return answer('waiting') end
   if gate and gateOwner~=id and (gate.phase=='pending' or gate.mode~='stable-build' or not paths['build:checkout']) then

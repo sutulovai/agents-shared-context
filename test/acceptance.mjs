@@ -22,12 +22,14 @@ const joinScenario = scenario.startsWith("join");
 let apiURL;
 await mkdir(directory);
 const vetoPlugin = path.join(root, "veto");
-if (scenario === "rollback") {
+if (scenario === "rollback" || scenario === "ambiguous-deny") {
   await mkdir(vetoPlugin);
   await writeFile(
     path.join(vetoPlugin, "index.ts"),
-    `export default {id:"fixture-veto",async setup(ctx){
+    `import {appendFileSync} from "node:fs";
+    export default {id:"fixture-veto",async setup(ctx){
     await ctx.permission.hook("evaluate",e=>{if(e.resources.includes("denied.txt")) {e.effect="deny"; e.message="Fixture denied the edit."}});
+    await ctx.tool.hook("execute.after",e=>appendFileSync(${JSON.stringify(path.join(root, "after-events"))},JSON.stringify({tool:e.tool,status:e.status})+"\\n"));
   }}`,
   );
 }
@@ -49,7 +51,7 @@ return ()=>c.abort()
   );
 }
 await writeFile(path.join(directory, "shared.txt"), "original\n");
-if (scenario === "failed-build")
+if (scenario === "failed-build" || scenario === "lost-grant")
   await writeFile(path.join(directory, "gradlew"), "#!/bin/sh\necho invoked >> builds\nexit 3\n", { mode: 0o755 });
 if (scenario === "build" || scenario === "veto")
   await writeFile(
@@ -80,6 +82,9 @@ async function snapshot() {
   }
 }
 let online = true;
+let dropStage = scenario === "ambiguous-deny";
+let droppedStage = false;
+let droppedPending;
 const connections = new Set();
 const proxy = net.createServer((client) => {
   if (!online) {
@@ -95,9 +100,31 @@ const proxy = net.createServer((client) => {
     upstream.destroy();
   });
   upstream.on("close", () => client.destroy());
-  client.pipe(upstream).pipe(client);
+  let discard = false;
+  client.on("data", (data) => {
+    if (dropStage && data.includes(Buffer.from("\r\nstage\r\n"))) {
+      dropStage = false;
+      discard = true;
+    }
+    upstream.write(data);
+  });
+  upstream.on("data", async (data) => {
+    if (discard) {
+      const observer = new Redis(redisPort, "127.0.0.1");
+      try {
+        droppedPending = Object.values(await observer.hgetall((await locate(directory)).project)).map(
+          (row) => JSON.parse(row).pending,
+        );
+      } finally {
+        observer.disconnect();
+      }
+      droppedStage = true;
+      client.destroy();
+    } else client.write(data);
+  });
 });
-if (scenario === "recover") await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+if (["recover", "ambiguous-deny"].includes(scenario))
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
 const errors = [];
 let releaseOwner;
 const hold = new Promise((resolve) => {
@@ -126,7 +153,33 @@ const server = http.createServer(async (req, res) => {
     observed.push({ actor, step, names });
     let call;
     const patch = (file, content) => `*** Begin Patch\n*** Add File: ${file}\n+${content}\n*** End Patch`;
-    if (scenario === "veto" && actor === "owner" && step === 2) {
+    if (scenario === "ambiguous-deny" && step === 1) {
+      call = ["patch", { patchText: patch("denied.txt", "wrong") }];
+    } else if (scenario === "ambiguous-deny" && step === 2) {
+      assert.ok(droppedStage, "The proxy did not discard the stage response");
+      assert.ok(
+        droppedPending.some((pending) => Object.keys(pending).length > 0),
+        JSON.stringify(droppedPending),
+      );
+      assert.match(text, /Fixture denied/);
+      await delay(2300);
+      call = ["coord_who", {}];
+    } else if (scenario === "ambiguous-deny") {
+      await hold;
+    } else if (scenario === "lost-grant" && step === 1) {
+      call = ["coord_exclusive", { mode: "stable-build", reason: "Final verification" }];
+    } else if (scenario === "lost-grant" && step === 2) {
+      assert.ok((await snapshot()).some((participant) => participant.policy?.phase === "exclusive"));
+      const client = new Redis(redisPort, "127.0.0.1");
+      try {
+        await client.del((await locate(directory)).project);
+      } finally {
+        client.disconnect();
+      }
+      call = ["shell", { command: "./gradlew test", timeout: 30000 }];
+    } else if (scenario === "lost-grant") {
+      assert.match(text, /protection.*lost/i);
+    } else if (scenario === "veto" && actor === "owner" && step === 2) {
       await admitted;
       call = ["coord_exclusive", { mode: "stable-build", reason: "Final verification" }];
     } else if (scenario === "veto" && actor === "owner" && step === 3) {
@@ -180,9 +233,13 @@ const server = http.createServer(async (req, res) => {
         call = ["patch", { patchText: patch("resumed.txt", "resumed") }];
     } else if (["outage", "deny"].includes(scenario) || (joinScenario && actor === "peer")) {
       if (joinScenario) {
-        assert.equal(names.includes("patch"), false, "Waiting session retained edit tools");
-        assert.match(text, /coord-parallel/);
+        if (scenario !== "join-default-wait") {
+          assert.equal(names.includes("patch"), false, "Waiting session retained edit tools");
+          assert.match(text, /coord-parallel/);
+        }
       }
+    } else if (scenario === "join-default-wait" && actor === "owner" && step === 1) {
+      call = ["coord_who", {}];
     } else if (step === 1 && actor === "owner") {
       call = [
         "patch",
@@ -253,7 +310,7 @@ const env = {
   ASC_LOCAL_KEY: "offline-test",
   OPENCODE_PASSWORD: randomUUID(),
 };
-const port = scenario === "recover" ? proxy.address().port : redisPort;
+const port = ["recover", "ambiguous-deny"].includes(scenario) ? proxy.address().port : redisPort;
 // A closed port is not a safe outage fixture: another test can bind one. This server accepts and resets.
 const refusing = net.createServer((socket) => socket.destroy());
 if (["outage", "deny"].includes(scenario))
@@ -262,8 +319,8 @@ const offlinePort = refusing.listening ? refusing.address().port : 0;
 const containersBefore = globalManaged
   ? ""
   : execFileSync("docker", ["ps", "-aq", "--filter", "name=agents-shared-context-"], { encoding: "utf8" }).trim();
-const joinMode = joinScenario ? "ask" : "parallel";
-const extras = scenario === "rollback" ? [vetoPlugin] : [];
+const joinMode = joinScenario && scenario !== "join-default-wait" ? "ask" : "parallel";
+const extras = ["rollback", "ambiguous-deny"].includes(scenario) ? [vetoPlugin] : [];
 // Mirrors the README install: one global plugin entry in managed mode, nothing project-local.
 const pluginEntry = { package: plugin, options: { managed: globalManaged, join: joinMode } };
 if (!globalManaged) {
@@ -328,10 +385,49 @@ function run(prompt, api) {
 }
 try {
   const owner = run("OWNER_CASE");
-  if (["outage", "deny"].includes(scenario)) {
+  if (scenario === "ambiguous-deny") {
+    for (let i = 0; i < 200 && (calls.get("owner") ?? 0) < 3 && !errors.length; i++) await delay(50);
+    assert.equal(errors.length, 0, errors.join(";"));
+    assert.ok((calls.get("owner") ?? 0) >= 3, owner.output());
+    await assert.rejects(readFile(path.join(directory, "denied.txt")), { code: "ENOENT" });
+    const events = await readFile(path.join(root, "after-events"), "utf8").catch(() => "");
+    const after = events
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const client = new Redis(redisPort, "127.0.0.1");
+    let records;
+    try {
+      records = Object.values(await client.hgetall((await locate(directory)).project)).map((row) =>
+        JSON.parse(row),
+      );
+    } finally {
+      client.disconnect();
+    }
+    console.log(
+      `Denial lifecycle: after=${JSON.stringify(after)} pending=${JSON.stringify(records.map((r) => r.pending))}`,
+    );
+    assert.ok(
+      after.some((event) => event.tool === "patch" && event.status === "error"),
+      "No after callback for denied patch",
+    );
+    assert.ok(
+      records.every((record) => Object.keys(record.pending).length === 0),
+      "Denied call left a pending stage",
+    );
+    releaseOwner();
+    assert.equal((await owner.done).code, 0);
+    console.log("PASS: denied ambiguous edit triggered error callback and was settled.");
+  } else if (["outage", "deny", "lost-grant"].includes(scenario)) {
     const result = await Promise.race([owner.done, delay(40000, null, { ref: false })]);
     assert.ok(result, "Offline edit timed out");
-    if (scenario === "deny") {
+    if (scenario === "lost-grant") {
+      assert.equal(result.code, 0, result.output);
+      assert.equal(errors.length, 0, errors.join(";"));
+      assert.match(result.output, /protection.*lost/i);
+      await assert.rejects(readFile(path.join(directory, "builds")), { code: "ENOENT" });
+      console.log("PASS: lost stable-source grant refused the build before shell launch.");
+    } else if (scenario === "deny") {
       await assert.rejects(readFile(path.join(directory, "offline.txt")), { code: "ENOENT" });
       assert.match(result.output, /denied|deny/i);
       console.log("PASS: native permission denial still prevents the edit during a Redis outage.");
@@ -344,7 +440,7 @@ try {
       for (const name of ["coord_who", "patch"])
         assert.match(calls.find((e) => e.part.tool === name).part.state.output, /Shared context unavailable/);
       assert.equal(await readFile(path.join(directory, "offline.txt"), "utf8"), "written\n");
-      console.log("PASS: Redis unavailable; native patch applied with a visible warning.");
+      console.log("PASS: Redis unavailable; native patch applied with a model-facing tool warning.");
     }
   } else {
     for (let n = 0; n < 400; n++) {
@@ -360,7 +456,7 @@ try {
       if (owner.child.exitCode !== null || errors.length) break;
       await delay(100);
     }
-    if (!["build", "failed-build"].includes(scenario))
+    if (!["build", "failed-build", "join-default-wait"].includes(scenario))
       assert.equal(
         await readFile(path.join(directory, "shared.txt"), "utf8"),
         "owner\n",
@@ -386,6 +482,9 @@ try {
       );
       online = false;
       for (const client of connections) client.destroy();
+    }
+    if (scenario === "join-default-wait") {
+      assert.ok((await snapshot()).some((p) => p.state === "active" && p.paths.length === 0));
     }
     if (joinScenario) {
       const socket = http.createServer();
@@ -466,6 +565,35 @@ try {
         for (let i = 0; i < 100 && (calls.get("peer") ?? 0) < 2; i++) await delay(100);
         assert.equal(calls.get("peer"), 2, "Wait command did not enter the wait step");
         await assert.rejects(readFile(path.join(directory, "resumed.txt")), { code: "ENOENT" });
+        if (scenario === "join-default-wait") {
+          let messages = "";
+          let running = false;
+          let progress = false;
+          for (let i = 0; i < 50; i++) {
+            messages = execFileSync(
+              "opencode",
+              ["api", "--server", apiURL, "get", `/api/session/${session}/message`],
+              { env, cwd: directory, encoding: "utf8" },
+            );
+            const data = JSON.parse(messages).data;
+            const part = data
+              .flatMap((message) => message.content ?? [])
+              .find(
+                (item) => item.type === "tool" && item.name === "coord_wait" && item.state?.status === "running",
+              );
+            running ||= !!part;
+            progress ||= /Waiting for session .*Stop the tool to cancel/.test(part?.state?.metadata?.title ?? "");
+            if (running && (process.env.ASC_REQUIRE_PROGRESS !== "1" || progress)) break;
+            await delay(100);
+          }
+          assert.ok(running, `Running coord_wait was not observed: ${messages}`);
+          if (process.env.ASC_REQUIRE_PROGRESS === "1") {
+            assert.ok(progress, "Running coord_wait did not expose progress metadata");
+            console.log("PASS: isolated server session messages expose the active wait progress metadata.");
+          } else {
+            console.log("PASS: isolated server exposes the running wait; progress rendering is not required.");
+          }
+        }
         if (scenario === "join-cancel") {
           execFileSync(
             "opencode",

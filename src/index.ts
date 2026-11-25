@@ -15,7 +15,8 @@ type Member = {
   closed: boolean;
   build?: string;
   buildVeto?: string;
-  veto?: { request: string; policy: Policy; releasing?: boolean };
+  protectedBuild?: string;
+  veto?: { request: string; policy: Policy; establishing?: boolean; releasing?: boolean };
   waiting: boolean;
   notices: Map<string, string>;
   staged: Set<string>;
@@ -23,7 +24,7 @@ type Member = {
   shellNoticed?: boolean;
 };
 const outage =
-  "Shared context unavailable. Work may overlap; exclusivity and source stability are not guaranteed. Check local Redis or Docker. Existing OpenCode permissions still apply.";
+  "Shared context unavailable. Ordinary work may overlap and exclusivity is not guaranteed; a protected build will not start without a verified grant. Check local Redis or Docker. Existing OpenCode permissions still apply.";
 const scopeError =
   "Shared context could not identify the session directory. Verify that it still exists and that Git is available.";
 const key = "shared-context/status";
@@ -45,6 +46,7 @@ export default {
     const members = new Map<ID, Promise<Member>>();
     const ending = new Map<ID, Promise<void>>();
     const choices = new Map<ID, "parallel" | "wait">();
+    const projectWaits = new Map<ID, string>();
     const missing = new Set<ID>();
     const stop = new AbortController();
     const member = (id: ID) => {
@@ -114,9 +116,12 @@ export default {
         missing.delete(id);
       } catch {}
     }
-    async function enter(id: ID, m: Member) {
-      const parallel = m.child || join === "parallel" || choices.get(id) === "parallel" || m.joined;
+    async function enter(id: ID, m: Member, projectWait = projectWaits.has(id)) {
+      const request = projectWait ? projectWaits.get(id) : undefined;
+      const parallel =
+        !projectWait && (m.child || join === "parallel" || choices.get(id) === "parallel" || m.joined);
       const r = await transact(m, parallel ? "parallel" : "join");
+      if (request && projectWaits.get(id) !== request) return r;
       m.joined = r.status === "active" || (m.joined && r.status === "read-only");
       m.waiting = r.status === "waiting" || r.status === "read-only";
       return r;
@@ -136,15 +141,32 @@ export default {
         return `Another session is active: ${r.label ?? r.owner ?? "another session"}. Join it (/coord-wait) or work in parallel (/coord-parallel)?`;
       return `Reservation not granted: ${r.status}. Retry after checking coord_who.`;
     }
-    async function reserve(id: ID, m: Member, paths: string[], call?: string, expected = m.veto?.request) {
+    async function reserve(
+      id: ID,
+      m: Member,
+      paths: string[],
+      call?: string,
+      expected = m.veto?.request,
+      strict = false,
+    ) {
       const op = call ? "stage" : "claim";
-      let r = await transact(m, op, paths, call, undefined, expected);
+      const prior = !!call && m.staged.has(call);
+      const stage = async (grant?: string) => {
+        if (call) m.staged.add(call);
+        const reply = await transact(m, op, paths, call, undefined, grant);
+        if (call && !prior && reply.status !== "acquired") m.staged.delete(call);
+        return reply;
+      };
+      let r = await stage(expected);
       if (r.status === "lost") {
         // A veto that Redis no longer knows must not keep blocking its own owner.
         if (expected && m.veto?.request === expected) m.veto = undefined;
+        if (strict) {
+          return r;
+        }
         const admitted = await enter(id, m);
         if (admitted.status !== "active") return admitted;
-        r = await transact(m, op, paths, call);
+        r = await stage();
       }
       await recovered(id, m);
       return r;
@@ -156,6 +178,7 @@ export default {
       return r;
     }
     const end = async (id: ID) => {
+      projectWaits.delete(id);
       const pending = members.get(id);
       if (!pending) return ending.get(id);
       members.delete(id);
@@ -213,7 +236,6 @@ export default {
       })) {
         if (e.type === "session.idle") {
           const pending = members.get(e.data.sessionID);
-          if (!pending) continue;
           const s = await ctx.session.get({ sessionID: e.data.sessionID }).catch(() => undefined);
           if (
             !s ||
@@ -245,10 +267,15 @@ export default {
         const r = await enter(id, m);
         if (r.status === "active") {
           await recovered(id, m);
+          if (projectWaits.has(id)) {
+            for (const name of Object.keys(event.tools))
+              if (name !== "coord_who" && name !== "coord_wait") delete event.tools[name];
+            event.system.push({ type: "text", text: "Call coord_wait to wait for the project." });
+          }
           return;
         }
         if (r.status === "read-only") {
-          const wait = choices.get(id) === "wait";
+          const wait = projectWaits.has(id) || choices.get(id) === "wait";
           const allowed = new Set(
             wait ? ["coord_wait", "coord_who"] : ["read", "glob", "grep", "coord_who", "coord_wait"],
           );
@@ -266,7 +293,7 @@ export default {
           event.system.push({ type: "text", text: describe(r, m) });
           return;
         }
-        const wait = choices.get(id) === "wait";
+        const wait = projectWaits.has(id) || choices.get(id) === "wait";
         for (const name of Object.keys(event.tools))
           if (name !== "coord_who" && (!wait || name !== "coord_wait")) delete event.tools[name];
         event.system.push({
@@ -300,7 +327,6 @@ export default {
         if (!paths.length) return;
         const call = event.source?.type === "tool" ? `${event.source.messageID}:${event.source.id}` : undefined;
         const r = await reserve(event.sessionID, m, paths, call);
-        if (r.status === "acquired" && call) m.staged.add(call);
         if (r.status !== "acquired") {
           event.effect = "deny";
           event.message = describe(r, m);
@@ -325,18 +351,33 @@ export default {
       if (build && m.build) throw new Error("Conflict: another build is running in this session.");
       if (build) {
         m.build = event.id;
-        m.buildVeto = m.veto?.policy.mode === "stable-build" ? m.veto.request : undefined;
+        m.buildVeto = m.protectedBuild;
       }
       const call = `${event.messageID}:${event.id}`;
       try {
-        const r = await reserve(event.sessionID, m, build ? ["build:checkout"] : [], call);
-        if (r.status !== "acquired") refusal = describe(r, m);
-        else m.staged.add(call);
+        const r = await reserve(
+          event.sessionID,
+          m,
+          build ? ["build:checkout"] : [],
+          call,
+          m.buildVeto ?? m.veto?.request,
+          !!m.buildVeto,
+        );
+        if (r.status !== "acquired")
+          refusal =
+            m.buildVeto && r.status === "lost"
+              ? "Stable-source protection was lost. Request a new grant before building."
+              : describe(r, m);
       } catch {
         await warn(event.sessionID, m);
+        if (m.buildVeto) {
+          if (m.staged.has(call)) m.settling.set(call, "abandon");
+          refusal = "Stable-source protection could not be verified. Request a new grant before building.";
+        }
       }
       if (refusal) {
         if (build) {
+          if (m.protectedBuild === m.buildVeto) m.protectedBuild = undefined;
           m.build = undefined;
           m.buildVeto = undefined;
         }
@@ -369,6 +410,7 @@ export default {
         } catch {
           await warn(event.sessionID, m);
         }
+        if (m.protectedBuild === m.buildVeto) m.protectedBuild = undefined;
         m.build = undefined;
         m.buildVeto = undefined;
       }
@@ -412,33 +454,51 @@ export default {
         async execute(raw, context) {
           const m = await member(context.sessionID).catch(() => undefined);
           if (!m) return { content: scopeError };
-          if (m.veto)
-            return { content: "This session already requested exclusivity. Check coord_who or use coord_share." };
+          const previous = m.veto;
+          if (previous) {
+            if (previous.establishing)
+              return {
+                content: "This session already requested exclusivity. Check coord_who or use coord_share.",
+              };
+            try {
+              const existing = await transact(m, "veto", [], previous.request);
+              if (m.veto && (m.veto !== previous || existing.status === "ok"))
+                return {
+                  content: "This session already requested exclusivity. Check coord_who or use coord_share.",
+                };
+              if (m.veto === previous) m.veto = undefined;
+            } catch {
+              await warn(context.sessionID, m);
+              return { content: outage };
+            }
+          }
           const { mode, reason } = raw as Policy;
           if (!["work", "stable-build"].includes(mode) || !reason.trim())
             throw new Error("Expected a mode and a nonempty reason");
           const request = randomUUID(),
             policy = { mode, reason: reason.trim() };
           const signal = AbortSignal.any([context.signal, stop.signal]);
-          m.veto = { request, policy };
+          m.veto = { request, policy, establishing: true };
           let granted = false;
           try {
             // A session without a Redis field would otherwise be told that another session is active.
             const admitted = await enter(context.sessionID, m);
             if (admitted.status !== "active") {
-              m.veto = undefined;
+              if (m.veto?.request === request) m.veto = undefined;
               return { content: describe(admitted, m) };
             }
             while (!m.closed && m.veto?.request === request && !m.veto.releasing) {
               signal.throwIfAborted();
               const r = await transact(m, "exclusive", [], request, policy);
+              if (m.veto?.request === request) m.veto.establishing = false;
               if (r.status === "exclusive" && m.veto?.request === request && !m.veto.releasing) {
                 granted = true;
+                if (mode === "stable-build") m.protectedBuild = request;
                 return {
                   content:
                     mode === "stable-build"
-                      ? "Stable sources and the build slot reserved. Run the direct foreground build now."
-                      : "Project exclusive for this session. Use coord_share when finished.",
+                      ? "Stable sources and the build slot reserved for tracked coordinated operations. Manual, external, or lease-lost operations are not covered. Run the direct foreground build now."
+                      : "Project exclusive for this session. Only tracked coordinated operations are covered; manual, external, or lease-lost operations are not. Use coord_share when finished.",
                 };
               }
               if (r.status !== "pending") return { content: describe(r, m) };
@@ -468,9 +528,13 @@ export default {
         async execute(_, context) {
           const m = await member(context.sessionID).catch(() => undefined);
           if (!m) return { content: scopeError };
-          if (!m.veto) return { content: "This session owns no exclusive request." };
+          if (!m.veto) {
+            m.protectedBuild = undefined;
+            return { content: "This session owns no exclusive request." };
+          }
           if (m.build && m.buildVeto === m.veto.request)
             return { content: "Wait for this session's stable build to finish." };
+          m.protectedBuild = undefined;
           try {
             const r = await yieldVeto(m, m.veto.request);
             return {
@@ -540,27 +604,49 @@ export default {
           if (!m) return { content: scopeError };
           const requested = (raw as { paths?: string[] }).paths ?? [];
           const paths = requested.length ? await fileResources(m.scope, requested) : [];
-          const established = m.joined && !m.waiting;
+          const established = m.joined;
+          const projectWait = projectWaits.get(context.sessionID);
+          const membership = members.get(context.sessionID);
           const signal = AbortSignal.any([context.signal, stop.signal]);
           try {
             let blocked: string | undefined;
+            let lastBlocker: string | undefined;
             while (!m.closed) {
               signal.throwIfAborted();
+              if (projectWait && projectWaits.get(context.sessionID) !== projectWait) break;
               try {
-                const r = await enter(context.sessionID, m);
+                const r = await enter(context.sessionID, m, !!projectWait);
+                if (projectWait && projectWaits.get(context.sessionID) !== projectWait) break;
                 if (r.status === "active") {
                   await recovered(context.sessionID, m);
-                  const probe = await transact(m, "probe", paths);
+                  const probe = await transact(m, projectWait ? "project-probe" : "probe", paths, projectWait);
+                  if (projectWait && projectWaits.get(context.sessionID) !== projectWait) break;
                   if (probe.status === "ok")
                     return {
-                      content: paths.length
-                        ? `Available: no other session holds ${requested.join(", ")}.`
-                        : "Available: no other session holds files in this project. Resume work.",
+                      content: projectWait
+                        ? "Available: no participant is blocking this project wait. Resume work."
+                        : `${paths.length ? `Available: no other session holds ${requested.join(", ")}.` : "Available: no other session holds files in this project."} This is not a reservation; re-read and claim files before editing.`,
                     };
-                  if (probe.status !== "conflict" && probe.status !== "read-only")
+                  if (probe.status !== "conflict" && probe.status !== "read-only" && probe.status !== "waiting")
                     return { content: describe(probe, m) };
                   blocked = describe(probe, m);
+                  const blocker = probe.owner ?? probe.status;
+                  if (blocker !== lastBlocker) {
+                    await context.progress?.({
+                      title: `Waiting for session ${blocker.slice(-6)}. Stop the tool to cancel.`,
+                    });
+                    lastBlocker = blocker;
+                  }
                 } else if (r.status !== "waiting" && r.status !== "read-only") return { content: describe(r, m) };
+                else {
+                  const blocker = r.owner ?? r.sessions[0]?.id ?? r.status;
+                  if (blocker !== lastBlocker) {
+                    await context.progress?.({
+                      title: `Waiting for session ${blocker.slice(-6)}. Stop the tool to cancel.`,
+                    });
+                    lastBlocker = blocker;
+                  }
+                }
               } catch {
                 await warn(context.sessionID, m);
                 return { content: outage };
@@ -569,7 +655,26 @@ export default {
             }
             return { content: `Wait cancelled.${blocked ? ` Last status: ${blocked}` : ""}` };
           } finally {
-            if (signal.aborted && !established && members.has(context.sessionID)) await end(context.sessionID);
+            const currentWait = !projectWait || projectWaits.get(context.sessionID) === projectWait;
+            if (projectWait && currentWait) {
+              projectWaits.delete(context.sessionID);
+              try {
+                await transact(m, "project-unwait", [], projectWait);
+              } catch {
+                await warn(context.sessionID, m);
+              }
+            }
+            if (
+              signal.aborted &&
+              currentWait &&
+              !projectWaits.has(context.sessionID) &&
+              choices.get(context.sessionID) !== "parallel" &&
+              !established &&
+              !m.joined &&
+              !m.staged.size &&
+              members.get(context.sessionID) === membership
+            )
+              await end(context.sessionID);
           }
         },
       });
@@ -581,13 +686,26 @@ export default {
           description:
             mode === "wait" ? "Wait for other sessions before continuing" : "Continue alongside other sessions",
           async execute({ sessionID, delivery }) {
-            choices.set(sessionID, mode);
+            const request = randomUUID();
+            if (mode === "wait") projectWaits.set(sessionID, request);
+            else {
+              projectWaits.delete(sessionID);
+              choices.set(sessionID, mode);
+            }
             if (choices.size > 1024) choices.delete(choices.keys().next().value!);
-            await ctx.session.prompt({
-              sessionID,
-              delivery,
-              text: "Continue the original task using the selected coordination mode.",
-            });
+            try {
+              await ctx.session.prompt({
+                sessionID,
+                delivery,
+                text:
+                  mode === "wait"
+                    ? "Call coord_wait to wait for the project, then continue the original task."
+                    : "Continue the original task using the selected coordination mode.",
+              });
+            } catch (error) {
+              if (mode === "wait" && projectWaits.get(sessionID) === request) projectWaits.delete(sessionID);
+              throw error;
+            }
           },
         });
       }

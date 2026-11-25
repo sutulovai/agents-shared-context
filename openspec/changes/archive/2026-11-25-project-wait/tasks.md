@@ -1,0 +1,4 @@
+- [x] Archive the parallel-default admission change.
+- [x] Add project-wait regression tests and store logic.
+- [x] Verify packed-server progress exposure and run final checks.
+- [x] Archive this change after verification.

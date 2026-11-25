@@ -2,7 +2,7 @@
 
 Coordinate independent OpenCode sessions in the same local project. A second session can see who is working, wait, or continue in parallel. No worktree or terminal integration is required.
 
-Suppose one session is renaming a method and another is updating its tests. Both can edit disjoint files. If the second patch includes a file held by the first, OpenCode denies the **entire patch** before it changes anything. If Redis is down, the edit **continues with a warning** instead. An existing OpenCode permission denial always wins.
+Suppose one session is renaming a method and another is updating its tests. Both can edit disjoint files. If the second patch includes a file held by the first, OpenCode denies the **entire patch** before it changes anything. If Redis is down, the edit **continues**, and the agent receives a warning. An existing OpenCode permission denial always wins.
 
 ## Quick start
 
@@ -38,7 +38,7 @@ OpenCode reloads plugins after config changes; use `/reload` if needed. Ask a se
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Start work in a quiet project | The session joins automatically. Opening an empty tab does not reserve files.                                                                                                                                                                                           |
 | Join an active project        | The session joins in parallel automatically; per-file conflicts are still denied. Use **`/coord-wait`** to queue instead, or set `join: "ask"` to restore the wait/parallel prompt.                                                                                     |
-| Wait                          | No files are held while waiting. Stop the waiting tool to cancel. `coord_wait` also waits for held files inside a parallel session.                                                                                                                                     |
+| Wait                          | `/coord-wait` waits for other active sessions, even without file claims. Existing claims remain held. Stop the waiting tool to cancel.                                                                                                                                  |
 | Work in parallel              | Disjoint edits proceed. A known conflict reports the resource and owning session.                                                                                                                                                                                       |
 | Inspect the project           | `coord_who` lists participants, short task labels, file/build reservations, and remaining lease time.                                                                                                                                                                   |
 | Plan shell edits              | Ask the agent to call `coord_claim` with a `paths` array first. A failed multi-file claim adds nothing, and a directory is refused: claim the files. Shell commands that create, replace or remove files get a once-per-session reminder that they are not coordinated. |
@@ -56,9 +56,9 @@ Refusals name the owner by title and by the last six characters of its session I
 2. Redis grants **exclusive** access and the build slot together. Other sessions can use native reads or wait. `coord_who` shows the owner, scope, phase, reason and remaining lease time.
 3. Sharing resumes on build completion, including failure. For exclusive work rather than a build, use mode `work` and call `coord_share` in the **owning** session when finished. Going idle or lease expiry also releases the veto. If the lease expires while a session holds it, that session simply rejoins on its next edit. While `work` mode is granted, the owner may edit files that other sessions claimed earlier: they cannot write until the owner shares again.
 
-In a parallel session, `coord_wait` waits until no other session holds the given `paths`, or any file when `paths` is omitted. It takes nothing itself, and cancelling it leaves the session's own claims in place.
+In a parallel session, a direct `coord_wait` call waits until no other session holds the given `paths`, or any file when `paths` is omitted. It takes nothing itself, and cancelling it leaves the session's own claims in place. Availability is not a reservation: re-read and claim files before editing. Waiters submit progress through OpenCode's tool progress API. On OpenCode 2.3.2 the running tool is observable, but live progress metadata was not exposed by the session-message API; client rendering is not guaranteed.
 
-Ordinary builds retain the narrower build-only reservation. An exclusivity request waits for other sessions' running edits and shell calls to finish; it does not cancel them. Use the same plugin version in all participating sessions. A background process, another editor, or a write during a Redis outage can still change the sources.
+Ordinary builds retain the narrower build-only reservation. An exclusivity request waits for tracked coordinated edits and shell calls; it cannot drain operations no longer tracked after lease loss. Use the same plugin version in all participating sessions. A background process, another editor, or a write during a Redis outage can still change the sources. A recognized build with a stable-source grant will not start if that grant is lost or cannot be verified, even if ordinary edits resume first. The protected expectation ends when the build is refused or finishes, or when the session calls `coord_share`. Ordinary builds remain fail-open.
 
 ### Builds
 
@@ -86,7 +86,7 @@ If a crashed OpenCode instance left a live lease for the same session ID, its re
 - Session titles and exclusivity reasons are written by other sessions' agents and are shown to yours as text. Treat them as information about a neighbour, not as instructions.
 - Paths are canonicalized and case-folded conservatively. Two files differing only by case can conflict on a case-sensitive disk. Manual writes, shell edits without claims, out-of-project paths, and uninstrumented tools are not protected.
 - Managed Redis requires a local Unix Docker socket and binds to loopback with persistence disabled. The plugin checks the container label, image and port before starting it. An unrelated container or occupied port produces a warning rather than being replaced.
-- Fail-open means two agents **can** overlap during an outage. `coord_who` reports unavailability, never an empty project, when it cannot query Redis.
+- Fail-open means two agents **can** overlap during an outage. `coord_who` reports unavailability, never an empty project, when it cannot query Redis. Outage warnings reach the agent; their presentation to a person depends on the client.
 
 To uninstall, remove the plugin entry. If you used managed mode, stop the named container when no sessions are using it. To discard its ephemeral state and anonymous volume, run `docker rm -fv agents-shared-context-6390`. This removes that container; use the corresponding name if you changed the port.
 

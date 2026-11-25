@@ -23,18 +23,42 @@ async function fixture(t, options = {}) {
   // The plugin talks to Redis through a proxy the test can switch off to imitate a short outage.
   const upstreamPort = Number(new URL(process.env.REDIS_URL ?? "redis://127.0.0.1:6379").port || 6379);
   let online = true;
+  let dropStage = false;
+  let holdOperation;
+  const sockets = new Set();
   const proxy = net.createServer((client) => {
+    sockets.add(client);
+    client.on("close", () => sockets.delete(client));
     if (!online) return client.destroy();
     const upstream = net.connect(upstreamPort, "127.0.0.1");
+    let discardReply = false;
     client.on("error", () => client.destroy());
     upstream.on("error", () => client.destroy());
     client.on("close", () => upstream.destroy());
     upstream.on("close", () => client.destroy());
-    client.pipe(upstream).pipe(client);
+    client.on("data", (data) => {
+      if (holdOperation && data.includes(Buffer.from(`\r\n${holdOperation.name}\r\n`))) {
+        const held = holdOperation;
+        holdOperation = undefined;
+        held.seen();
+        held.release.then(() => upstream.write(data));
+        return;
+      }
+      if (dropStage && data.includes(Buffer.from("\r\nstage\r\n"))) {
+        dropStage = false;
+        discardReply = true;
+        upstream.write(data);
+      } else upstream.write(data);
+    });
+    upstream.on("data", (data) => {
+      if (discardReply) client.destroy();
+      else client.write(data);
+    });
   });
   await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
   const hooks = new Map(),
-    tools = new Map();
+    tools = new Map(),
+    commands = new Map();
   const clock = {};
   const hook = async (key, fn) => {
     hooks.set(key, fn);
@@ -52,10 +76,11 @@ async function fixture(t, options = {}) {
       }),
       // The warning path writes a session instruction; without this stub a failure masks itself as a TypeError.
       instructions: { entry: { put: async () => {}, remove: async () => {} } },
+      prompt: async () => {},
     },
     permission: { hook },
     tool: { hook, transform: async (fn) => fn({ add: (t) => tools.set(t.name, t) }) },
-    command: { transform: async () => {} },
+    command: { transform: async (fn) => fn({ add: (c) => commands.set(c.name, c) }) },
     event: {
       subscribe: async function* ({ signal }) {
         signal.addEventListener("abort", () => feed.close(), { once: true });
@@ -87,6 +112,7 @@ async function fixture(t, options = {}) {
   };
   return {
     tools,
+    commands,
     hooks,
     turn,
     feed,
@@ -95,7 +121,19 @@ async function fixture(t, options = {}) {
     client,
     cleanup: unload,
     project: (await locate(directory)).project,
-    setOnline: (value) => (online = value),
+    setOnline: (value) => {
+      online = value;
+      if (!value) for (const socket of sockets) socket.destroy();
+    },
+    dropStage: () => (dropStage = true),
+    hold: (name) => {
+      let seen;
+      let release;
+      const observed = new Promise((resolve) => (seen = resolve));
+      const released = new Promise((resolve) => (release = resolve));
+      holdOperation = { name, seen, release: released };
+      return { observed, release };
+    },
   };
 }
 
@@ -157,6 +195,36 @@ test("cancelling a draining veto preserves the running shell; a later exclusive 
   await hooks.get("execute.before")(shell);
 });
 
+test("slash wait blocks on a claimless peer and reports progress", async (t) => {
+  const { tools, commands, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await commands.get("coord-wait").execute({ sessionID: "newcomer", delivery: "append" });
+  await turn("newcomer");
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const progress = [];
+  const waiting = tools.get("coord_wait").execute(
+    {},
+    {
+      sessionID: "newcomer",
+      signal: ctl.signal,
+      progress: async (update) => progress.push(update),
+    },
+  );
+  let settled = false;
+  waiting.finally(() => (settled = true)).catch(() => {});
+  await delay(200);
+  assert.equal(settled, false, "A peer without claims still blocks project wait");
+  assert.ok(progress.length, "A blocked wait publishes progress");
+  clock.parent = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: "parent" } }, handled }),
+  );
+  assert.match((await waiting).content, /Available/);
+  await turn("another");
+  assert.ok((await turn("newcomer")).tools.patch, "Completed command must not gate unrelated turns");
+});
+
 test("coord_wait in a parallel session waits until the blocking claim is released", async (t) => {
   const { tools, hooks, turn, feed, clock } = await fixture(t);
   await turn("parent");
@@ -178,12 +246,203 @@ test("coord_wait in a parallel session waits until the blocking claim is release
   await new Promise((handled) =>
     feed.enqueue({ event: { type: "session.idle", data: { sessionID: "parent" } }, handled }),
   );
-  assert.match((await waiting).content, /^Available: no other session holds owned\.txt\.$/);
+  assert.match((await waiting).content, /not a reservation; re-read and claim files before editing/);
   const child = await tools.get("coord_who").execute({}, { sessionID: "child" });
   assert.ok(
     JSON.parse(child.content).some((s) => s.id === "child"),
     "Cancelling-free wait must not end membership",
   );
+});
+
+test("slash wait keeps newcomers waiting rather than activating them", async (t) => {
+  const { tools, commands, turn, client, project } = await fixture(t);
+  await turn("parent");
+  for (const id of ["first", "second"]) {
+    await commands.get("coord-wait").execute({ sessionID: id, delivery: "append" });
+    await turn(id);
+  }
+  const records = await client.hgetall(project);
+  assert.equal(JSON.parse(records.first).state, "waiting");
+  assert.equal(JSON.parse(records.second).state, "waiting");
+  const ctl = new AbortController();
+  const calls = ["first", "second"].map((id) =>
+    tools.get("coord_wait").execute({}, { sessionID: id, signal: ctl.signal, progress: async () => {} }),
+  );
+  await delay(100);
+  ctl.abort();
+  await Promise.all(calls.map((call) => assert.rejects(call, { name: "AbortError" })));
+});
+
+test("an idle command without a tool call does not gate the next turn", async (t) => {
+  const { commands, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await commands.get("coord-wait").execute({ sessionID: "newcomer", delivery: "append" });
+  clock.newcomer = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: "newcomer" } }, handled }),
+  );
+  clock.newcomer = { busy: Date.now() };
+  assert.ok((await turn("newcomer")).tools.patch);
+});
+
+test("cancelling an old project wait after switching to parallel preserves resumed work", async (t) => {
+  const { tools, commands, turn, hooks, client, project } = await fixture(t);
+  await turn("parent");
+  await commands.get("coord-wait").execute({ sessionID: "newcomer", delivery: "append" });
+  await turn("newcomer");
+  const ctl = new AbortController();
+  const waiting = tools.get("coord_wait").execute(
+    {},
+    {
+      sessionID: "newcomer",
+      signal: ctl.signal,
+      progress: async () => {},
+    },
+  );
+  await delay(100);
+  await commands.get("coord-parallel").execute({ sessionID: "newcomer", delivery: "append" });
+  await turn("newcomer");
+  assert.match((await invoke(tools, "coord_claim", "newcomer", { paths: ["mine.txt"] })).content, /Reserved/);
+  const shell = {
+    tool: "shell",
+    input: { command: "git status" },
+    id: "call",
+    messageID: "msg",
+    sessionID: "newcomer",
+  };
+  await hooks.get("execute.before")(shell);
+  const before = JSON.parse(await client.hget(project, "newcomer"));
+  ctl.abort();
+  await assert.rejects(waiting, { name: "AbortError" });
+  const after = JSON.parse(await client.hget(project, "newcomer"));
+  assert.equal(after.token, before.token);
+  assert.deepEqual(after.paths, before.paths);
+  assert.deepEqual(after.pending, before.pending);
+});
+
+test("cancelling a superseded wait does not clear a newer wait", async (t) => {
+  const { tools, commands, turn } = await fixture(t);
+  await turn("parent");
+  const old = new AbortController();
+  const current = new AbortController();
+  t.after(() => current.abort());
+  await commands.get("coord-wait").execute({ sessionID: "newcomer", delivery: "append" });
+  await turn("newcomer");
+  const first = tools.get("coord_wait").execute(
+    {},
+    {
+      sessionID: "newcomer",
+      signal: old.signal,
+      progress: async () => {},
+    },
+  );
+  await delay(100);
+  await commands.get("coord-wait").execute({ sessionID: "newcomer", delivery: "append" });
+  const second = tools.get("coord_wait").execute(
+    {},
+    {
+      sessionID: "newcomer",
+      signal: current.signal,
+      progress: async () => {},
+    },
+  );
+  await delay(100);
+  old.abort();
+  await assert.rejects(first, { name: "AbortError" });
+  assert.ok(!(await turn("newcomer")).tools.patch, "Newer wait must still gate edits");
+  current.abort();
+  await assert.rejects(second, { name: "AbortError" });
+});
+
+test("cancelling slash wait preserves an active session's claims", async (t) => {
+  const { tools, commands, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "child", { paths: ["mine.txt"] });
+  await commands.get("coord-wait").execute({ sessionID: "child", delivery: "append" });
+  await turn("child");
+  const ctl = new AbortController();
+  const waiting = tools.get("coord_wait").execute(
+    {},
+    {
+      sessionID: "child",
+      signal: ctl.signal,
+      progress: async () => {},
+    },
+  );
+  await delay(100);
+  ctl.abort();
+  await assert.rejects(waiting, { name: "AbortError" });
+  const sessions = JSON.parse((await invoke(tools, "coord_who", "child")).content);
+  assert.ok(sessions.find((s) => s.id === "child")?.paths.some((p) => p.startsWith("file:mine.txt@")));
+  assert.equal(JSON.parse(await client.hget(project, "child")).projectWaitUntil, undefined);
+});
+
+test("two established project waiters make progress without losing their claims", async (t) => {
+  const { tools, commands, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["parent.txt"] });
+  await invoke(tools, "coord_claim", "child", { paths: ["child.txt"] });
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const progress = [];
+  const start = async (id) => {
+    await commands.get("coord-wait").execute({ sessionID: id, delivery: "append" });
+    return tools
+      .get("coord_wait")
+      .execute({}, { sessionID: id, signal: ctl.signal, progress: async (v) => progress.push(v) });
+  };
+  const first = start("parent");
+  first.catch(() => {});
+  for (let i = 0; i < 100 && !progress.length; i++) await delay(10);
+  assert.ok(progress.length, "First waiter must see the active peer");
+  const second = start("child");
+  second.catch(() => {});
+  const winner = await Promise.race([
+    first.then(() => "parent"),
+    second.then(() => "child"),
+    delay(2500, "timeout"),
+  ]);
+  assert.notEqual(winner, "timeout", "Established waiters must not deadlock each other");
+  const completed = winner === "parent" ? first : second;
+  assert.equal((await completed).content, "Available: no participant is blocking this project wait. Resume work.");
+  const records = JSON.parse((await invoke(tools, "coord_who", winner)).content);
+  assert.ok(records.find((p) => p.id === "parent").paths.some((p) => p.startsWith("file:parent.txt@")));
+  assert.ok(records.find((p) => p.id === "child").paths.some((p) => p.startsWith("file:child.txt@")));
+  clock[winner] = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: winner } }, handled }),
+  );
+  const remaining = winner === "parent" ? second : first;
+  assert.match((await remaining).content, /Available/);
+});
+
+test("wait progress changes only when its blocker changes", async (t) => {
+  const { tools, commands, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await turn("other");
+  await turn("child");
+  await commands.get("coord-wait").execute({ sessionID: "child", delivery: "append" });
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const progress = [];
+  const waiting = tools
+    .get("coord_wait")
+    .execute({}, { sessionID: "child", signal: ctl.signal, progress: async (value) => progress.push(value) });
+  waiting.catch(() => {});
+  await delay(1700);
+  assert.equal(progress.length, 1, JSON.stringify(progress));
+  const blocker = progress[0].title.includes("parent") ? "parent" : "other";
+  clock[blocker] = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: blocker } }, handled }),
+  );
+  await delay(1600);
+  assert.equal(progress.length, 2, JSON.stringify(progress));
+  assert.notEqual(progress[0].title, progress[1].title);
+  ctl.abort();
+  await assert.rejects(waiting, { name: "AbortError" });
 });
 
 test("cancelling coord_wait keeps an established parallel session and its claims", async (t) => {
@@ -252,6 +511,195 @@ test("a veto that Redis no longer holds does not block its own owner", async (t)
   );
 });
 
+test("a lost veto can be requested again without an intervening edit", async (t) => {
+  const { tools, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "First" });
+  await client.del(project);
+  assert.match(
+    (await invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "Again" })).content,
+    /exclusive/,
+  );
+});
+
+test("a duplicate exclusive request during admission cannot replace the first", async (t) => {
+  const { tools, turn, hold } = await fixture(t);
+  await turn("parent");
+  const gate = hold("parallel");
+  const first = invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "First" });
+  await gate.observed;
+  const second = invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "Second" });
+  await delay(50);
+  gate.release();
+  assert.match((await second).content, /already requested/);
+  assert.match((await first).content, /^Project exclusive/);
+});
+
+test("a refused restage does not discard an earlier stage of the same call", async (t) => {
+  const { tools, hooks, turn } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "child", { paths: ["held.txt"] });
+  const edit = {
+    action: "edit",
+    sessionID: "parent",
+    resources: ["mine.txt"],
+    effect: "ask",
+    source: { type: "tool", messageID: "m", id: "edit" },
+  };
+  await hooks.get("evaluate")(edit);
+  assert.equal(edit.effect, "ask");
+  const refused = { ...edit, resources: ["held.txt"] };
+  await hooks.get("evaluate")(refused);
+  assert.equal(refused.effect, "deny");
+  await hooks.get("execute.after")({
+    tool: "edit",
+    sessionID: "parent",
+    messageID: "m",
+    id: "edit",
+    status: "completed",
+    result: { content: "ok" },
+  });
+  const reply = await invoke(
+    tools,
+    "coord_exclusive",
+    "child",
+    { mode: "work", reason: "Next" },
+    AbortSignal.timeout(1500),
+  );
+  assert.match(reply.content, /^Project exclusive/);
+  const parent = JSON.parse((await invoke(tools, "coord_who", "child")).content).find((s) => s.id === "parent");
+  assert.ok(parent.paths.some((p) => p.startsWith("file:mine.txt")));
+});
+
+test("a protected build cannot start after its grant is lost", async (t) => {
+  const { tools, hooks, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  await client.del(project);
+  const shell = {
+    tool: "shell",
+    input: { command: "npm test" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  };
+  await assert.rejects(hooks.get("execute.before")(shell), /protection|grant/i);
+});
+
+test("a lost stable grant survives an intervening ordinary edit until the build is refused", async (t) => {
+  const { tools, hooks, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  await client.del(project);
+  const edit = { action: "edit", sessionID: "parent", resources: ["x.txt"], effect: "ask" };
+  await hooks.get("evaluate")(edit);
+  assert.equal(edit.effect, "ask");
+  const shell = {
+    tool: "shell",
+    input: { command: "npm test" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  };
+  await assert.rejects(hooks.get("execute.before")(shell), /protection|grant/i);
+  await hooks.get("execute.before")({ ...shell, id: "ordinary" });
+});
+
+test("explicit sharing cancels a lost stable-build expectation", async (t) => {
+  const { tools, hooks, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  await client.del(project);
+  await hooks.get("evaluate")({ action: "edit", sessionID: "parent", resources: ["x.txt"], effect: "ask" });
+  await invoke(tools, "coord_share", "parent");
+  await hooks.get("execute.before")({
+    tool: "shell",
+    input: { command: "npm test" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  });
+});
+
+test("an ambiguous protected restage abandons an existing call without an after callback", async (t) => {
+  const { tools, hooks, turn, client, project, dropStage } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  const shell = {
+    tool: "shell",
+    input: { command: "git status" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  };
+  await hooks.get("execute.before")(shell);
+  await client.del(project);
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["kept.txt"] });
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  dropStage();
+  await assert.rejects(
+    hooks.get("execute.before")({ ...shell, input: { command: "npm test" } }),
+    /protection|grant/i,
+  );
+  await delay(2300);
+  await invoke(tools, "coord_share", "parent");
+  const reply = await invoke(
+    tools,
+    "coord_exclusive",
+    "child",
+    { mode: "work", reason: "Next" },
+    AbortSignal.timeout(1500),
+  );
+  assert.match(reply.content, /^Project exclusive/);
+  const parent = JSON.parse((await invoke(tools, "coord_who", "child")).content).find((s) => s.id === "parent");
+  assert.ok(parent.paths.some((p) => p.startsWith("file:kept.txt")));
+});
+
+test("an unverifiable protected build stops while an ordinary build fails open", async (t) => {
+  const { tools, hooks, turn, setOnline } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  setOnline(false);
+  const shell = {
+    tool: "shell",
+    input: { command: "npm test" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  };
+  await assert.rejects(hooks.get("execute.before")(shell), /protection|grant/i);
+  await hooks.get("execute.before")({ ...shell, sessionID: "child" });
+});
+
+test("a lost protected stage reply is abandoned without an after callback", async (t) => {
+  const { tools, hooks, turn, dropStage } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_exclusive", "parent", { mode: "stable-build", reason: "Verify" });
+  dropStage();
+  const shell = {
+    tool: "shell",
+    input: { command: "npm test" },
+    id: "build",
+    messageID: "m",
+    sessionID: "parent",
+  };
+  await assert.rejects(hooks.get("execute.before")(shell), /protection|grant/i);
+  await delay(2300);
+  await invoke(tools, "coord_share", "parent");
+  const reply = await invoke(
+    tools,
+    "coord_exclusive",
+    "child",
+    { mode: "work", reason: "Next" },
+    AbortSignal.timeout(1500),
+  );
+  assert.match(reply.content, /^Project exclusive/);
+});
+
 test("a session without a Redis record can request exclusivity in an empty project", async (t) => {
   const { tools } = await fixture(t);
   const reply = await invoke(tools, "coord_exclusive", "solo", { mode: "work", reason: "Start here" });
@@ -287,8 +735,37 @@ test("a finished call that Redis never acknowledged does not block later exclusi
   await hooks.get("execute.after")({ ...shell, status: "completed", result: { content: "" } });
   setOnline(true);
   await delay(2300);
-  const reply = await invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "After the blip" });
+  await turn("child");
+  const reply = await invoke(
+    tools,
+    "coord_exclusive",
+    "parent",
+    { mode: "work", reason: "After the blip" },
+    AbortSignal.timeout(1500),
+  );
   assert.match(reply.content, /^Project exclusive for this session\./);
+  assert.ok(JSON.parse((await invoke(tools, "coord_who", "parent")).content).some((s) => s.id === "child"));
+});
+
+test("an applied stage with a lost reply is settled without ending its session", async (t) => {
+  const { tools, hooks, turn, dropStage } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  const shell = { tool: "shell", input: { command: "sleep 1" }, id: "call", messageID: "msg", sessionID: "child" };
+  dropStage();
+  await hooks.get("execute.before")(shell);
+  await hooks.get("execute.after")({ ...shell, status: "completed", result: { content: "" } });
+  await delay(2300);
+  await turn("child");
+  const reply = await invoke(
+    tools,
+    "coord_exclusive",
+    "parent",
+    { mode: "work", reason: "After the blip" },
+    AbortSignal.timeout(1500),
+  );
+  assert.match(reply.content, /^Project exclusive for this session\./);
+  assert.ok(JSON.parse((await invoke(tools, "coord_who", "parent")).content).some((s) => s.id === "child"));
 });
 
 test("a finished stable build tells its session that source protection ended", async (t) => {
