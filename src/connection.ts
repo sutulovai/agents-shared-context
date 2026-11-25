@@ -73,12 +73,14 @@ async function ensureContainer(port: number) {
       if (!/already in use/i.test(String(e))) throw e;
     }
     // A competing create reserves the name before Docker makes the container inspectable.
-    for (let attempt = 0; ; attempt++) {
+    // CI daemons can take several seconds; poll on a deadline, not a fixed attempt count.
+    const until = Date.now() + 5000;
+    for (;;) {
       try {
         info = await inspect();
         break;
       } catch (e) {
-        if (attempt >= 10 || !/no such (container|object)/i.test(String(e))) throw e;
+        if (Date.now() >= until || !/no such (container|object)/i.test(String(e))) throw e;
         await delay(100);
       }
     }
