@@ -46,6 +46,7 @@ try {
     "join-wait",
     "join-default-wait",
     "join-cancel",
+    "peer-status",
     "build",
     "veto",
     "failed-build",

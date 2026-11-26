@@ -59,6 +59,36 @@ after(async () => {
   redis.disconnect();
 });
 
+test("peer status changes only an active owner's report, not the lease or claims", async () => {
+  const post = (owner, text, reference) =>
+    change(redis, key, "status", owner, [], 600000, JSON.stringify({ text, reference }));
+  assert.equal((await post(a, "Too early")).status, "lost");
+  await run("parallel", a);
+  await run("join", b);
+  await run("claim", a, ["held"]);
+  const expiry = () => redis.call("HPEXPIRETIME", key, "FIELDS", 1, a.id);
+  const deadline = await expiry();
+  assert.equal((await post(b, "Still waiting")).status, "waiting");
+  assert.equal((await post({ ...a, token: "other" }, "Not mine")).status, "lost");
+  assert.equal((await post(a, "Changing the auth contract", "#42")).status, "ok");
+  const read = async () => (await run("who", b)).sessions.find((s) => s.id === a.id);
+  const first = await read();
+  assert.equal(first.reportedStatus.text, "Changing the auth contract");
+  assert.equal(first.reportedStatus.reference, "#42");
+  assert.equal(first.reportedStatus.stale, false);
+  assert.ok(first.reportedStatus.updatedAt > 0);
+  assert.equal((await post(a, "Contract ready")).status, "ok");
+  const updated = await read();
+  assert.equal(updated.reportedStatus.text, "Contract ready");
+  assert.equal(updated.reportedStatus.reference, undefined);
+  assert.deepEqual(updated.paths, ["held"]);
+  assert.deepEqual(await expiry(), deadline);
+  await run("renew", a, [], 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(await read(), undefined);
+  await run("leave", b);
+});
+
 test("only one simultaneous arrival starts; waiters do not keep each other waiting", async () => {
   const results = await Promise.all([run("join", a), run("join", b)]);
   assert.deepEqual(results.map((x) => x.status).sort(), ["active", "waiting"]);

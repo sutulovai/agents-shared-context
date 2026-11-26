@@ -106,7 +106,7 @@ async function fixture(t, options = {}) {
     }
   });
   const turn = async (sessionID) => {
-    const event = { sessionID, tools: { patch: {}, coord_who: {} }, system: [] };
+    const event = { sessionID, tools: { patch: {}, coord_who: {}, coord_status: {} }, system: [] };
     await hooks.get("context")(event);
     return event;
   };
@@ -140,6 +140,40 @@ async function fixture(t, options = {}) {
 const invoke = (tools, name, id, input = {}, signal = new AbortController().signal) =>
   tools.get(name).execute(input, { sessionID: id, signal });
 
+test("active peers get rate-limited status reminders without seeing peer text in their prompts", async (t) => {
+  const { tools, turn, client, project, setOnline } = await fixture(t);
+  const reminder = /call coord_status/i;
+  const system = async (id) => (await turn(id)).system.map((entry) => entry.text).join("\n");
+  assert.doesNotMatch(await system("parent"), reminder);
+  assert.match(await system("child"), reminder);
+  assert.doesNotMatch(await system("child"), reminder);
+  await assert.rejects(async () => invoke(tools, "coord_status", "child", { text: "   " }), /status text/i);
+  await assert.rejects(
+    async () => invoke(tools, "coord_status", "child", { text: "x".repeat(241) }),
+    /status text/i,
+  );
+  assert.match(
+    (await invoke(tools, "coord_status", "child", { text: "  Peer-only contract note  ", reference: "#42" }))
+      .content,
+    /status updated/i,
+  );
+  assert.doesNotMatch(await system("child"), reminder);
+  assert.doesNotMatch(await system("parent"), /Peer-only contract note/);
+  const discover = async () =>
+    JSON.parse((await invoke(tools, "coord_who", "parent")).content).find((s) => s.id === "child");
+  assert.equal((await discover()).reportedStatus.text, "Peer-only contract note");
+  const row = JSON.parse(await client.hget(project, "child"));
+  row.reportedStatus.updatedAt -= 600001;
+  await client.hset(project, "child", JSON.stringify(row));
+  t.mock.method(Date, "now", () => row.reportedStatus.updatedAt + 1200002);
+  assert.equal((await discover()).reportedStatus.stale, true);
+  assert.match(await system("child"), reminder);
+  assert.doesNotMatch(await system("child"), reminder);
+  setOnline(false);
+  const offline = await invoke(tools, "coord_status", "child", { text: "Offline" });
+  assert.match(offline.content, /unavailable/i);
+  assert.doesNotMatch(offline.content, /status updated/i);
+});
 test("a child runs without another join prompt but cannot take its parent's reservation", async (t) => {
   const { tools, hooks, turn, feed } = await fixture(t);
   await turn("parent");

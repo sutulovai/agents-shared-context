@@ -12,7 +12,9 @@ export interface Participant {
   paths: string[];
   expiresInMs: number;
   policy?: Policy & { scope: "project"; phase: "pending" | "exclusive" };
+  reportedStatus?: { text: string; reference?: string; updatedAt: number; stale: boolean };
 }
+export const statusFreshMs = 600000;
 export interface Policy {
   mode: "work" | "stable-build";
   reason: string;
@@ -32,6 +34,7 @@ export type Operation =
   | "exclusive"
   | "share"
   | "veto"
+  | "status"
   | "who";
 export interface Reply {
   status:
@@ -51,13 +54,18 @@ export interface Reply {
   label?: string;
   path?: string;
   reason?: string;
+  statusDue?: boolean;
 }
 
 // Redis 7.4 field expiration lets each session disappear independently, even when other sessions stay busy.
 const transact = `
 local key, op, id, token, label, ttl = KEYS[1], unpack(ARGV,1,5)
-local function answer(status, sessions, owner, path, reason, ownerLabel)
-  return cjson.encode({status=status, sessions=sessions, owner=owner, path=path, reason=reason, label=ownerLabel})
+local function answer(status, sessions, owner, path, reason, ownerLabel, statusDue)
+  return cjson.encode({status=status, sessions=sessions, owner=owner, path=path, reason=reason, label=ownerLabel,statusDue=statusDue})
+end
+local function nowMs()
+  local time=redis.call('TIME')
+  return tonumber(time[1])*1000+math.floor(tonumber(time[2])/1000)
 end
 local value=redis.call('HGET',key,id)
 local self=value and cjson.decode(value)
@@ -78,6 +86,16 @@ if op=='veto' then
   return answer('lost')
 end
 if not self and op~='join' and op~='parallel' and op~='who' then return answer('lost') end
+if op=='status' then
+  if self.state~='active' then return answer('waiting') end
+  local deadline=redis.call('HPEXPIRETIME',key,'FIELDS',1,id)[1]
+  if deadline<=0 then return answer('lost') end
+  self.reportedStatus=cjson.decode(ARGV[6])
+  self.reportedStatus.updatedAt=nowMs()
+  redis.call('HSET',key,id,cjson.encode(self))
+  redis.call('HPEXPIREAT',key,deadline,'FIELDS',1,id)
+  return answer('ok')
+end
 if not self and op~='who' and redis.call('HLEN',key)>=128 then return answer('full') end
 if op=='project-unwait' then
   if self.projectWaitRequest and self.projectWaitRequest~=ARGV[6] then return answer('ok') end
@@ -99,10 +117,10 @@ for i=10,#ARGV do paths[ARGV[i]]=true end
 local override=self and self.policy and self.policy.phase=='exclusive' and self.policy.mode=='work'
 local peers={}
 local gate, gateOwner, gateLabel, draining
-local now=0
-if op=='project-probe' then
-  local time=redis.call('TIME')
-  now=tonumber(time[1])*1000+math.floor(tonumber(time[2])/1000)
+local now=(op=='project-probe' or op=='who' or call=='status-reminder') and nowMs() or 0
+local hasActivePeer=false
+local function statusStale(report)
+  return not report or now-report.updatedAt>=${statusFreshMs}
 end
 if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' or op=='stage' or op=='probe' or op=='project-probe' then
   local rows=redis.call('HGETALL',key)
@@ -111,6 +129,7 @@ if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' o
     if p.policy then gate=p.policy; gateOwner=rows[i]; gateLabel=p.label end
     if op=='exclusive' and (next(p.pending) or (p.kept['build:checkout'] and not (rows[i]==id and p.policy and p.policy.phase=='exclusive'))) then draining=rows[i] end
     if op=='who' or (rows[i]~=id and p.state=='active') then
+      if rows[i]~=id and p.state=='active' then hasActivePeer=true end
       if op=='project-probe' and (not p.projectWaitUntil or p.projectWaitUntil<=now or next(p.pending)) then
         table.insert(peers,{id=rows[i],label=p.label})
       end
@@ -122,7 +141,10 @@ if op=='who' or op=='join' or op=='parallel' or op=='exclusive' or op=='claim' o
           return answer('conflict',nil,rows[i],p.paths[1],nil,p.label)
         end
       elseif op=='who' or op=='join' then
+        local report=op=='who' and p.reportedStatus or nil
+        if report then report.stale=statusStale(report) end
         table.insert(peers,{id=rows[i],label=p.label,state=p.state,paths=p.paths,
+          reportedStatus=report,
           policy=p.policy and {scope='project',mode=p.policy.mode,reason=p.policy.reason,phase=p.policy.phase},
           expiresInMs=redis.call('HPTTL',key,'FIELDS',1,rows[i])[1]})
       end
@@ -198,7 +220,8 @@ self.paths=collect(all)
 if #self.paths>256 then return answer('full') end
 redis.call('HSET',key,id,cjson.encode(self))
 redis.call('HPEXPIRE',key,ttl,'FIELDS',1,id)
-return answer(status,peers,status=='read-only' and gateOwner or (status=='pending' and draining or nil),nil,status=='read-only' and gate.reason or nil,status=='read-only' and gateLabel or nil)
+local statusDue=call=='status-reminder' and status=='active' and hasActivePeer and statusStale(self.reportedStatus)
+return answer(status,peers,status=='read-only' and gateOwner or (status=='pending' and draining or nil),nil,status=='read-only' and gate.reason or nil,status=='read-only' and gateLabel or nil,statusDue or nil)
 `;
 
 export async function change(

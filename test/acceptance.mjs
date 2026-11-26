@@ -153,7 +153,16 @@ const server = http.createServer(async (req, res) => {
     observed.push({ actor, step, names });
     let call;
     const patch = (file, content) => `*** Begin Patch\n*** Add File: ${file}\n+${content}\n*** End Patch`;
-    if (scenario === "ambiguous-deny" && step === 1) {
+    if (scenario === "peer-status" && actor === "owner" && step === 1) {
+      call = ["coord_status", { text: "Preparing the response contract", reference: "#42" }];
+    } else if (scenario === "peer-status" && actor === "peer" && step === 1) {
+      assert.match(text, /call coord_status/i);
+      assert.doesNotMatch(text, /Preparing the response contract/);
+      call = ["coord_who", {}];
+    } else if (scenario === "peer-status" && actor === "peer" && step === 2) {
+      assert.match(text, /Preparing the response contract/);
+      assert.match(text, /#42/);
+    } else if (scenario === "ambiguous-deny" && step === 1) {
       call = ["patch", { patchText: patch("denied.txt", "wrong") }];
     } else if (scenario === "ambiguous-deny" && step === 2) {
       assert.ok(droppedStage, "The proxy did not discard the stage response");
@@ -456,7 +465,7 @@ try {
       if (owner.child.exitCode !== null || errors.length) break;
       await delay(100);
     }
-    if (!["build", "failed-build", "join-default-wait"].includes(scenario))
+    if (!["build", "failed-build", "join-default-wait", "peer-status"].includes(scenario))
       assert.equal(
         await readFile(path.join(directory, "shared.txt"), "utf8"),
         "owner\n",
@@ -516,7 +525,13 @@ try {
     const result = await Promise.race([peer.done, delay(45000, null, { ref: false })]);
     assert.ok(result, `Peer timed out: ${errors.join(";")} ${peer.output()}`);
     assert.equal(result.code, 0, result.output);
-    if (scenario === "veto") {
+    if (scenario === "peer-status") {
+      assert.equal(errors.length, 0, errors.join(";"));
+      assert.equal(calls.get("peer"), 2);
+      assert.match(owner.output(), /Status updated/);
+      assert.match(result.output, /Preparing the response contract/);
+      console.log("PASS: peer status is visible on demand; context contains only a generic reminder.");
+    } else if (scenario === "veto") {
       assert.equal(errors.length, 0, errors.join(";"));
       assert.match(result.output, /Read-only:.*Final verification/);
       await assert.rejects(readFile(path.join(directory, "during-build.txt")), { code: "ENOENT" });

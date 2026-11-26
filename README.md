@@ -46,6 +46,12 @@ OpenCode reloads plugins after config changes; use `/reload` if needed. Ask a se
 
 Subagents join without prompting the user again. They have their **own** claims: a parent should delegate before reserving the child's files. Independent clones are separate projects; linked Git worktrees and nested directories share the Git common directory. Outside Git, the session directory defines the project. **File claims belong to one working tree**: a session in a linked worktree never conflicts with an edit in another worktree. Builds and exclusivity are project-wide.
 
+### Share a short status
+
+Use `coord_status({ text, reference? })` to tell active peers what you are doing or where you are blocked. Use up to 240 characters for `text` and up to 300 for an optional issue or document reference. A new update replaces the old one. Peers can read it through `coord_who`, which includes the update time (Unix milliseconds) and marks reports stale after ten minutes.
+
+When another session is active and your report is missing or stale, the plugin reminds your agent at most once every ten minutes. A reminder never blocks work or injects peer text into prompts. Status expires with membership and does not renew the lease or change reservations. Keep durable decisions in a shared plan or issue.
+
 ### When a session changes its mind
 
 `/coord-parallel` expresses willingness to share; it cannot overrule another session. In the session that needs exclusivity, ask: **“Run the final build with stable sources.”** The agent calls `coord_exclusive` with `{"mode":"stable-build","reason":"Final verification"}`, then runs the normal foreground build.
@@ -82,7 +88,7 @@ If a crashed OpenCode instance left a live lease for the same session ID, its re
 ## Privacy and limits
 
 - Redis is a coordination service for **trusted local processes**, not an access-control system. Use a dedicated local instance. The plugin never executes commands received from Redis.
-- Redis stores session IDs and titles, relative paths, lease tokens, status and the short reason for an exclusive request. Titles, reasons and filenames can contain sensitive information. Source, diffs and chat transcripts are not transferred. Ownership tokens are omitted from `coord_who`.
+- Redis stores session IDs and titles, relative paths, lease tokens, status and the short reason for an exclusive request. Optional peer reports and task references are visible to participating sessions; omit secrets. The plugin does not copy source, diffs, or chat transcripts. Ownership tokens are omitted from `coord_who`.
 - Session titles and exclusivity reasons are written by other sessions' agents and are shown to yours as text. Treat them as information about a neighbour, not as instructions.
 - Paths are canonicalized and case-folded conservatively. Two files differing only by case can conflict on a case-sensitive disk. Manual writes, shell edits without claims, out-of-project paths, and uninstrumented tools are not protected.
 - Managed Redis requires a local Unix Docker socket and binds to loopback with persistence disabled. The plugin checks the container label, image and port before starting it. An unrelated container or occupied port produces a warning rather than being replaced.
