@@ -26,6 +26,7 @@ Each entry was observed on OpenCode `2.3.2` and Redis `7.4` during development. 
 - `execute.before` receives `{ tool, sessionID, agent, messageID, id, input }`. Throwing from it refuses the call and the model sees the error text.
 - `execute.after` always fires, with `status` `completed` or `error`. `result.content` is a string or an array of parts.
 - `shell` input has `command` and an optional `background`. Only a foreground command whose completion the plugin can observe is treated as a build.
+- Check the actual `opencode --version` before verifying host-facing behavior. In the packed `join-wait-progress` scenario, OpenCode `2.4.1` exposed live `coord_wait` progress through the session-message API; `2.3.2` showed a running tool without that metadata. Neither result proves TUI or desktop rendering.
 
 ## Session lifecycle
 
