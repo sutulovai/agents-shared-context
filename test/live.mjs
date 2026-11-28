@@ -19,7 +19,7 @@ execFileSync(process.execPath, [fileURLToPath(new URL("./require-redis.mjs", imp
 const model = process.env.ASC_LIVE_MODEL;
 const scenario = process.env.ASC_SCENARIO;
 assert.ok(
-  model && ["gate", "conflict", "stable-build"].includes(scenario),
+  model && ["gate", "conflict", "stable-build", "blocking-claim"].includes(scenario),
   "Set ASC_LIVE_MODEL and a known ASC_SCENARIO",
 );
 const plugin = process.env.ASC_PACKAGE ?? fileURLToPath(new URL("../", import.meta.url));
@@ -31,7 +31,7 @@ const children = new Set();
 const sessions = new Set();
 const all = [];
 // The gate peer answers at once, the conflict peer must outwait the owner, the build needs a long-running neighbour.
-const steps = { gate: 120, conflict: 40, "stable-build": 200 }[scenario];
+const steps = { gate: 120, conflict: 40, "stable-build": 200, "blocking-claim": 40 }[scenario];
 
 await mkdir(directory);
 execFileSync("git", ["init", "--quiet", directory]);
@@ -163,7 +163,15 @@ const transcript = () =>
     .join("\n");
 
 try {
-  const owner = run("owner loop", loop(scenario === "stable-build" ? "loop.txt" : "shared.txt", "owner"));
+  const ownerPrompt =
+    scenario === "blocking-claim"
+      ? `This is an automated coordination test. First reserve shared.txt for yourself by calling coord_claim once ` +
+        `with the input {"paths":["shared.txt"]}. Then append the line "owner step N" to shared.txt for N = 1..${steps}, ` +
+        `using the edit tool with exactly one separate edit call per line. Do not use shell, do not batch lines, ` +
+        `do not ask questions. If an edit fails, fix your call and continue. Stop only when an error contains ` +
+        `"Conflict" or "Read-only", and then report that exact error text.`
+      : loop(scenario === "stable-build" ? "loop.txt" : "shared.txt", "owner");
+  const owner = run("owner loop", ownerPrompt);
   await until(
     async () => (await lines(scenario === "stable-build" ? "loop.txt" : "shared.txt")).length >= 3,
     240000,
@@ -234,6 +242,37 @@ try {
       peerWaits: toolCalls(result).filter((c) => c.tool === "coord_wait").length,
       peerTools: [...new Set(toolCalls(result).map((c) => c.tool))],
     };
+  } else if (scenario === "blocking-claim") {
+    const peer = run(
+      "waiting claim",
+      `Another session is editing shared.txt. Reserve it for yourself by calling coord_claim once with the input {"paths":["shared.txt"],"wait":true}. ` +
+        `The call stays pending until the file frees up, so do not poll coord_who and do not repeat it while it waits. ` +
+        `When it reports the reservation, append the line "peer" to shared.txt with exactly one separate edit call, then stop. ${noQuestions}`,
+    );
+    result = await Promise.race([peer.done, delay(300000, null, { ref: false })]);
+    assert.ok(result, "Waiting session timed out");
+    const claimCalls = result.events.filter((e) => e.type === "tool_use" && e.part.tool === "coord_claim");
+    const peerCalls = toolCalls(result);
+    const why = JSON.stringify(peerCalls.map((c) => `${c.tool}[${c.status}]:${String(c.output).slice(0, 90)}`));
+    assert.equal(claimCalls.length, 1, `Expected exactly one coord_claim call\n${why}`);
+    assert.equal(claimCalls[0].part.state.input?.wait, true, "The claim must set wait: true");
+    assert.match(String(claimCalls[0].part.state.output ?? ""), /Reserved shared\.txt/);
+    const whoCalls = peerCalls.filter((c) => c.tool === "coord_who").length;
+    assert.ok(whoCalls <= 1, `The session polled coord_who ${whoCalls} times instead of waiting\n${why}`);
+    const writeEvents = result.events.filter(
+      (e) => e.type === "tool_use" && ["edit", "write", "patch"].includes(e.part.tool),
+    );
+    const ownerWrite = owner.state.events
+      .filter((e) => e.type === "tool_use" && ["edit", "write", "patch"].includes(e.part.tool))
+      .at(-1);
+    assert.ok(
+      writeEvents.length === 1 && ownerWrite && writeEvents[0].timestamp > ownerWrite.timestamp,
+      `Peer wrote at the wrong time\n${why}`,
+    );
+    const shared = await lines("shared.txt");
+    assert.equal(shared.at(-1), "peer", `Peer line missing\n${JSON.stringify(shared.slice(-4))}`);
+    assert.equal(shared.filter((l) => l.startsWith("owner step ")).length, steps, "Owner lines were lost");
+    extra = { whoCalls, peerTools: [...new Set(peerCalls.map((c) => c.tool))] };
   } else {
     const main = run(
       "final build",

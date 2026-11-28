@@ -23,6 +23,7 @@ type Member = {
   settling: Map<string, "finish" | "abandon">;
   shellNoticed?: boolean;
   statusReminderAt?: number;
+  whoStreak?: { last: string; count: number };
 };
 const outage =
   "Shared context unavailable. Ordinary work may overlap and exclusivity is not guaranteed; a protected build will not start without a verified grant. Check local Redis or Docker. Existing OpenCode permissions still apply.";
@@ -571,7 +572,28 @@ export default {
           try {
             const m = await member(context.sessionID);
             const r = await transact(m, "who");
-            return { content: r.status === "ok" ? JSON.stringify(r.sessions) : describe(r, m) };
+            const content = r.status === "ok" ? JSON.stringify(r.sessions) : describe(r, m);
+            const signature =
+              r.status === "ok"
+                ? JSON.stringify(
+                    r.sessions.map((s) => ({
+                      id: s.id,
+                      label: s.label,
+                      state: s.state,
+                      paths: s.paths,
+                      policy: s.policy,
+                      reportedStatus: s.reportedStatus,
+                    })),
+                  )
+                : content;
+            if (m.whoStreak?.last === signature) m.whoStreak.count += 1;
+            else m.whoStreak = { last: signature, count: 1 };
+            return {
+              content:
+                m.whoStreak.count >= 3
+                  ? `${content} This answer will not change by itself: call coord_claim with wait: true to block until held paths free up, call coord_wait to wait for the project, or ask the user to enter /coord-wait or /coord-parallel.`
+                  : content,
+            };
           } catch {
             return { content: outage };
           }
@@ -616,10 +638,13 @@ export default {
       editor.add({
         name: "coord_claim",
         description:
-          "Reserve project files before shell edits or planning parallel work. A conflict reserves nothing.",
+          "Reserve project files before shell edits or planning parallel work. A conflict reserves nothing. With wait: true the call blocks and retries until the paths free up instead of returning a conflict.",
         input: {
           type: "object",
-          properties: { paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 256 } },
+          properties: {
+            paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 256 },
+            wait: { type: "boolean" },
+          },
           required: ["paths"],
           additionalProperties: false,
         },
@@ -627,8 +652,40 @@ export default {
         async execute(raw, context) {
           const m = await member(context.sessionID).catch(() => undefined);
           if (!m) return { content: scopeError };
-          const requested = (raw as { paths: string[] }).paths;
+          const input = raw as { paths: string[]; wait?: boolean };
+          const requested = input.paths;
           const paths = await fileResources(m.scope, requested);
+          if (input.wait) {
+            const signal = AbortSignal.any([context.signal, stop.signal]);
+            let blocked: string | undefined;
+            let lastBlocker: string | undefined;
+            try {
+              while (!m.closed) {
+                signal.throwIfAborted();
+                await enter(context.sessionID, m);
+                const r = await reserve(context.sessionID, m, paths);
+                if (r.status === "acquired") return { content: `Reserved ${requested.join(", ")}` };
+                if (r.status !== "conflict" && r.status !== "read-only") return { content: describe(r, m) };
+                blocked = describe(r, m);
+                const blocker = r.owner ?? r.status;
+                if (blocker !== lastBlocker) {
+                  await context.progress?.({
+                    title: `Waiting for session ${blocker.slice(-6)}${
+                      r.status === "read-only" ? " (read-only)" : ""
+                    }. Stop the tool to cancel.`,
+                  });
+                  lastBlocker = blocker;
+                }
+                await delay(1500, undefined, { signal });
+              }
+              return { content: `Claim cancelled.${blocked ? ` Last status: ${blocked}` : ""}` };
+            } catch (error) {
+              if (signal.aborted)
+                return { content: `Claim cancelled.${blocked ? ` Last status: ${blocked}` : ""}` };
+              await warn(context.sessionID, m);
+              return { content: outage };
+            }
+          }
           try {
             const r = await reserve(context.sessionID, m, paths);
             return { content: r.status === "acquired" ? `Reserved ${requested.join(", ")}` : describe(r, m) };

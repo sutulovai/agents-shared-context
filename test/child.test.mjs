@@ -866,6 +866,44 @@ test("the heartbeat ends an idle session, and plugin cleanup removes every membe
   assert.deepEqual(await who(), [], "Plugin unload left members behind");
 });
 
+test("repeated identical coord_who answers gain waiting guidance and a changed answer resets it", async (t) => {
+  const { tools, turn, feed, clock } = await fixture(t);
+  const who = async () => (await invoke(tools, "coord_who", "parent")).content;
+  assert.doesNotMatch(await who(), /will not change by itself/);
+  assert.doesNotMatch(await who(), /will not change by itself/);
+  assert.match(await who(), /call coord_claim with wait: true/);
+  assert.match(await who(), /will not change by itself/, "A later identical answer keeps the guidance");
+  await turn("peer");
+  await invoke(tools, "coord_claim", "peer", { paths: ["other.txt"] });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+  assert.doesNotMatch(await who(), /will not change by itself/, "A changed answer resets the streak");
+  await tick();
+  assert.doesNotMatch(
+    await who(),
+    /will not change by itself/,
+    "The ticking lease countdown keeps the count below three",
+  );
+  await tick();
+  assert.match(
+    await who(),
+    /will not change by itself/,
+    "Identical participants behind a ticking lease countdown reach the guidance",
+  );
+  assert.doesNotMatch(
+    (await invoke(tools, "coord_who", "peer")).content,
+    /will not change by itself/,
+    "Another session polls on its own count",
+  );
+  assert.match(await who(), /will not change by itself/, "A peer poll leaves this session's streak alone");
+  clock.peer = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: "peer" } }, handled }),
+  );
+  assert.doesNotMatch(await who(), /will not change by itself/);
+  assert.doesNotMatch(await who(), /will not change by itself/);
+  assert.match(await who(), /will not change by itself/, "Guidance returns only after three identical answers");
+});
+
 test("a top-level newcomer joins an active project in parallel by default", async (t) => {
   const { tools, turn, directory } = await fixture(t);
   await turn("parent");
@@ -877,4 +915,147 @@ test("a top-level newcomer joins an active project in parallel by default", asyn
   const conflict = await invoke(tools, "coord_claim", "peer", { paths: ["owned.txt"] });
   assert.match(conflict.content, /Conflict/);
   await rm(directory, { recursive: true, force: true });
+});
+
+test("a waiting claim stays pending on a held path and reserves after release", async (t) => {
+  const { tools, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["owned.txt"] });
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const progress = [];
+  const pending = tools
+    .get("coord_claim")
+    .execute(
+      { paths: ["owned.txt"], wait: true },
+      { sessionID: "child", signal: ctl.signal, progress: async (update) => progress.push(update) },
+    );
+  let settled = false;
+  pending.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await delay(200);
+  assert.equal(settled, false, "A waiting claim must stay pending while another session holds the file");
+  assert.ok(progress.length, "A blocked claim must publish progress");
+  assert.match(progress[0].title, /parent/);
+  clock.parent = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: "parent" } }, handled }),
+  );
+  assert.match((await pending).content, /Reserved owned\.txt/);
+});
+
+test("two waiting claims race for one path and Redis decides exactly one winner", async (t) => {
+  const { tools, turn, feed, clock } = await fixture(t);
+  await turn("parent");
+  await turn("first");
+  await turn("second");
+  await invoke(tools, "coord_claim", "parent", { paths: ["contested.txt"] });
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const start = (id) =>
+    tools
+      .get("coord_claim")
+      .execute(
+        { paths: ["contested.txt"], wait: true },
+        { sessionID: id, signal: ctl.signal, progress: async () => {} },
+      );
+  const first = start("first");
+  const second = start("second");
+  first.catch(() => {});
+  second.catch(() => {});
+  clock.parent = { busy: 1, idle: 2 };
+  await new Promise((handled) =>
+    feed.enqueue({ event: { type: "session.idle", data: { sessionID: "parent" } }, handled }),
+  );
+  const winner = await Promise.race([first.then(() => "first"), second.then(() => "second")]);
+  const winning = winner === "first" ? first : second;
+  const losing = winner === "first" ? second : first;
+  assert.match((await winning).content, /Reserved/, "Exactly one racing claim must win the path");
+  let settled = false;
+  losing.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await delay(200);
+  assert.equal(settled, false, "The losing claim keeps waiting instead of surfacing an error");
+  ctl.abort();
+  assert.doesNotMatch((await losing).content, /Reserved/);
+});
+
+test("a waiting claim reserves the path once the holder's lease expires", async (t) => {
+  const { tools, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["held.txt"] });
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const pending = tools
+    .get("coord_claim")
+    .execute({ paths: ["held.txt"], wait: true }, { sessionID: "child", signal: ctl.signal });
+  await delay(100);
+  await client.hdel(project, "parent");
+  assert.match((await pending).content, /Reserved held\.txt/);
+});
+
+test("an immediate claim on a held path still returns the same conflict at once", async (t) => {
+  const { tools, turn } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["held.txt"] });
+  const reply = await invoke(tools, "coord_claim", "child", { paths: ["held.txt"] });
+  assert.match(reply.content, /^Conflict: held\.txt is held by parent \(parent\)\.$/);
+});
+
+test("cancelling a waiting claim resolves and reserves nothing", async (t) => {
+  const { tools, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  await invoke(tools, "coord_claim", "parent", { paths: ["held.txt"] });
+  const ctl = new AbortController();
+  const pending = tools
+    .get("coord_claim")
+    .execute({ paths: ["held.txt"], wait: true }, { sessionID: "child", signal: ctl.signal });
+  await delay(100);
+  ctl.abort();
+  const result = await pending;
+  assert.match(result.content, /cancel/i);
+  assert.match(result.content, /held\.txt is held by parent/);
+  const record = JSON.parse(await client.hget(project, "child"));
+  assert.deepEqual(Object.keys(record.paths), [], "A cancelled waiting claim must hold no paths");
+});
+
+test("a waiting claim reports a veto through progress and reserves nothing until it ends", async (t) => {
+  const { tools, turn, client, project } = await fixture(t);
+  await turn("parent");
+  await turn("child");
+  assert.match(
+    (await invoke(tools, "coord_exclusive", "parent", { mode: "work", reason: "Rework" })).content,
+    /exclusive/,
+  );
+  const ctl = new AbortController();
+  t.after(() => ctl.abort());
+  const progress = [];
+  const pending = tools
+    .get("coord_claim")
+    .execute(
+      { paths: ["held.txt"], wait: true },
+      { sessionID: "child", signal: ctl.signal, progress: async (update) => progress.push(update) },
+    );
+  let settled = false;
+  pending.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await delay(200);
+  assert.equal(settled, false, "A waiting claim must stay pending while a veto holds");
+  assert.ok(progress.length, "A waiting claim must report the read-only state through progress");
+  assert.match(progress[0].title, /parent/);
+  assert.match(progress[0].title, /\(read-only\)/, "The progress must distinguish a veto from a file conflict");
+  const record = JSON.parse(await client.hget(project, "child"));
+  assert.deepEqual(Object.keys(record.paths), [], "A waiting claim must reserve nothing while the veto stands");
+  await invoke(tools, "coord_share", "parent");
+  assert.match((await pending).content, /Reserved held\.txt/);
 });

@@ -67,7 +67,7 @@ Resource keys look like `file:src/a.ts@1a2b3c4d`: the suffix identifies the work
 
 Facts about this harness:
 
-- The model-facing tools are `edit` and `write`. There is no `patch` tool. The harness checks that the tool it wants is present and records the available list in `errors` when it is not.
+- The model-facing tools are `edit` and `write`; on OpenCode 2.4.1 a `patch` tool taking `patchText` also exists and is what the scripted scenarios call. The harness checks that the tool it wants is present and records the available list in `errors` when it is not.
 - Use the provider id `openai` with the package `@opencode/ai/providers/openai-compatible`. An arbitrary provider id produced `provider.invalid-output`.
 - Pass `--auto` and a unique `OPENCODE_PASSWORD`. An explicit `deny` rule still wins over `--auto`, which is what the `deny` scenario relies on.
 - The server binds to a random loopback port. A `serve` process is needed only for scenarios that call `opencode api`.
@@ -107,7 +107,7 @@ Decide from the evidence whether the plugin, the harness, the prompt, or the mod
 
 ## Live-model scenarios
 
-`test/live.mjs` needs `ASC_LIVE_MODEL`, `ASC_SCENARIO` (`gate`, `conflict`, `stable-build`) and `REDIS_URL`. It creates a throwaway Git project, starts archived sessions through the user's real OpenCode service, and deletes them afterwards. Starting sessions correctly is its own topic: read skill `opencode-live-sessions` first. The model-facing behaviours it caught are listed in [references/live-model-findings.md](references/live-model-findings.md).
+`test/live.mjs` needs `ASC_LIVE_MODEL`, `ASC_SCENARIO` (`gate`, `conflict`, `stable-build`, `blocking-claim`) and `REDIS_URL`. It creates a throwaway Git project, starts archived sessions through the user's real OpenCode service, and deletes them afterwards. Starting sessions correctly is its own topic: read skill `opencode-live-sessions` first. The model-facing behaviours it caught are listed in [references/live-model-findings.md](references/live-model-findings.md).
 
 Ask the user which model to use before the first run. A small model can skip a step and report it as done; rerun a suspicious failure on a stronger model before calling it a plugin defect.
 

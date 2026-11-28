@@ -47,6 +47,7 @@ try {
     "join-default-wait",
     "join-cancel",
     "peer-status",
+    "blocking-claim",
     "build",
     "veto",
     "failed-build",

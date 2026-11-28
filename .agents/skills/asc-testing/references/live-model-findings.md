@@ -48,3 +48,9 @@ Assertions kept: the build ran exactly once; an exclusive state with the build s
 - `stable-build`: `coord_exclusive` was found and used without being named; the owner's edit was refused with `Read-only`. The model then ran the build three times because the stub printed nothing, and called `coord_share` when told that protection had ended. The reruns ran as ordinary builds, which the specification allows. The tool result of a finished stable build now says that protection ended and how to ask again.
 
 Assertion kept for the build: it ran at least once and the neighbour was refused at least once while the session held exclusivity. The number of runs is recorded, not asserted.
+
+## Blocking claim (`gpustack/glm-5.3-flash`, 2026-11-28)
+
+- `blocking-claim`: the peer called `coord_claim` with `wait: true` on the first try, made zero `coord_who` polls, and wrote `shared.txt` with `edit` once the reservation landed. The owner's 40 edits ran without a refusal; the peer's write came after the owner's last one.
+- Scenario design: a live owner that must hold a file for its whole turn needs an explicit `coord_claim` first. The claim an edit takes is provisional and ends with the tool call, so a peer's blocking claim succeeded between the owner's edit steps in the first design and the owner then met a `Conflict`.
+- Assertion design: `toolCalls()` drops the event `timestamp`; ordering assertions must compare on the raw `tool_use` events. Two runs failed on these two mistakes before the scenario passed on the third.

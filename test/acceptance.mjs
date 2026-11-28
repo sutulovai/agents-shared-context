@@ -85,6 +85,7 @@ let online = true;
 let dropStage = scenario === "ambiguous-deny";
 let droppedStage = false;
 let droppedPending;
+let removeHolder;
 const connections = new Set();
 const proxy = net.createServer((client) => {
   if (!online) {
@@ -236,6 +237,27 @@ const server = http.createServer(async (req, res) => {
       call = ["coord_who", {}];
     } else if ((scenario === "deny" && step === 1) || (scenario === "outage" && step === 2)) {
       call = ["patch", { patchText: patch("offline.txt", "written") }];
+    } else if (scenario === "blocking-claim" && actor === "peer" && step === 1) {
+      call = ["coord_claim", { paths: ["shared.txt"], wait: true }];
+      removeHolder = delay(4000).then(async () => {
+        const client = new Redis(redisPort, "127.0.0.1");
+        try {
+          await client.del((await locate(directory)).project);
+        } finally {
+          client.disconnect();
+        }
+      });
+      removeHolder.catch((error) => errors.push(String(error)));
+    } else if (scenario === "blocking-claim" && actor === "peer" && step === 2) {
+      await removeHolder;
+      assert.ok(
+        (await snapshot()).some((p) => p.paths.some((x) => x.startsWith("file:shared.txt"))),
+        JSON.stringify(await snapshot()),
+      );
+      call = [
+        "patch",
+        { patchText: "*** Begin Patch\n*** Update File: shared.txt\n@@\n-owner\n+claimed\n*** End Patch" },
+      ];
     } else if (joinScenario && actor === "peer" && step > 1) {
       if (step === 2 && scenario !== "join-parallel") call = ["coord_wait", {}];
       else if (step === (scenario === "join-parallel" ? 2 : 3))
@@ -555,6 +577,19 @@ try {
       assert.equal(await readFile(path.join(directory, "offline.txt"), "utf8"), "written\n");
       assert.equal(await readFile(path.join(directory, "shared.txt"), "utf8"), "owner\n");
       console.log("PASS: offline edit continued; after reconnection the next conflicting patch was denied.");
+    } else if (scenario === "blocking-claim") {
+      assert.equal(errors.length, 0, errors.join(";"));
+      const events = result.output
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((e) => e.type === "tool_use");
+      const claim = events.find((e) => e.part.tool === "coord_claim");
+      assert.ok(claim, result.output);
+      assert.doesNotMatch(claim.part.state.output, /Conflict/);
+      assert.match(claim.part.state.output, /Reserved shared\.txt/);
+      assert.equal(await readFile(path.join(directory, "shared.txt"), "utf8"), "claimed\n");
+      console.log("PASS: wait:true claim blocked on a held file, reserved it once freed, and the edit completed.");
     } else if (joinScenario) {
       assert.equal(errors.length, 0, errors.join(";"));
       assert.ok((calls.get("peer") ?? 0) >= 1);
