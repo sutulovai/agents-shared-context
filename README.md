@@ -1,6 +1,6 @@
 # Agents Shared Context
 
-**Run multiple OpenCode sessions in one repo without stepping on each other’s edits.**
+**Edit different files in parallel from multiple OpenCode sessions. One overlapping file claim blocks the entire supported patch.**
 
 An OpenCode plugin that lets agents see who’s working, reserve files, and wait for a handoff. No extra worktree or terminal integration required.
 
@@ -18,7 +18,7 @@ An OpenCode plugin that lets agents see who’s working, reserve files, and wait
 
 ## Quick start
 
-Tested with OpenCode **2.3.2**. Building from source requires Node.js 22 or newer and npm. Git identifies project roots. For managed Redis, use a local Docker engine.
+Tested with OpenCode **2.3.2**. Building from source requires Node.js 22 or newer and npm. Git identifies project roots. Managed Redis requires a local Docker engine reachable through a Unix socket.
 
 ```sh
 git clone https://github.com/sutulovai/agents-shared-context.git
@@ -42,9 +42,14 @@ Add this entry to `plugins` in `~/.config/opencode/opencode.json`. Replace the e
 }
 ```
 
-OpenCode reloads plugins after config changes; use `/reload` if needed. Open two sessions in the same checkout. Start an edit in one and ask the other to call `coord_who` while the first is still active.
+OpenCode reloads plugins after config changes; use `/reload` if needed. In one session, ask your agent to call `coord_who` once. A session list (even `[]` if no work is active) confirms the plugin can read Redis. A Redis-unavailable warning means coordination is not working yet.
 
 In managed mode the first use creates or starts `agents-shared-context-6390`. Check its binding with `docker port agents-shared-context-6390 6379`.
+
+### Try a file reservation
+
+1. In Session A, ask your agent to claim `README.md` with `coord_claim`, then run `sleep 30` in the foreground in the same turn. The foreground call keeps the turn active; an idle session releases its claim.
+2. While Session A is still active, ask Session B in the same checkout to claim `README.md` without `wait: true`. It should report a conflict naming Session A and the file. Neither claim edits the file.
 
 ## Working with other sessions
 
@@ -54,7 +59,7 @@ In managed mode the first use creates or starts `agents-shared-context-6390`. Ch
 | Join an active project        | The session joins in parallel automatically; per-file conflicts are still denied. Use **`/coord-wait`** to queue instead, or set `join: "ask"` to restore the wait/parallel prompt.                                                                                                                                                                                                                                            |
 | Wait                          | `/coord-wait` waits for other active sessions, even without file claims. Existing claims remain held. Stop the waiting tool to cancel. To obtain held files themselves, sessions call `coord_claim` with `wait: true`; `/coord-wait` remains for waiting on the project as a whole.                                                                                                                                            |
 | Work in parallel              | Disjoint edits proceed. A known conflict reports the resource and owning session.                                                                                                                                                                                                                                                                                                                                              |
-| Inspect the project           | `coord_who` lists participants, short task labels, file/build reservations, and remaining lease time. Repeated identical answers gain a hint to call `coord_claim` with `wait: true` to block until held paths free up, call `coord_wait` to wait for the project, or ask the user to enter `/coord-wait` or `/coord-parallel`, instead of polling.                                                                            |
+| Inspect the project           | `coord_who` lists participants, short task labels, file/build reservations, and remaining lease time.                                                                                                                                                                                                                                                                                                                          |
 | Plan shell edits              | Ask the agent to call `coord_claim` with a `paths` array first. With `wait: true` the call blocks and retries until the paths free up instead of returning a conflict; this is the race-free way to obtain held files. A failed multi-file claim adds nothing, and a directory is refused: claim the files. Shell commands that create, replace or remove files get a once-per-session reminder that they are not coordinated. |
 | Finish a turn                 | Idle sessions release their reservations. A crash instead lets them expire.                                                                                                                                                                                                                                                                                                                                                    |
 
@@ -127,12 +132,12 @@ The managed test creates and removes its own Docker container. The acceptance su
 
 ### Live-model check
 
-`test/live.mjs` drives real OpenCode sessions through a model you choose, using your own OpenCode installation and provider account. It costs tokens and is never part of CI.
+`test/live.mjs` drives real OpenCode sessions through a model you choose, using your own OpenCode installation and provider account. It costs tokens and is never part of CI. Replace `provider/model` with your model ID before running.
 
 ```sh
 docker run --rm -d --name asc-live-redis -p 127.0.0.1::6379 redis:7.4-alpine redis-server --save '' --appendonly no
 export REDIS_URL=redis://127.0.0.1:$(docker port asc-live-redis 6379 | cut -d: -f2)
-export ASC_LIVE_MODEL=<provider/model>
+export ASC_LIVE_MODEL='provider/model'
 ASC_SCENARIO=gate         node test/live.mjs
 ASC_SCENARIO=conflict     node test/live.mjs
 ASC_SCENARIO=stable-build node test/live.mjs
