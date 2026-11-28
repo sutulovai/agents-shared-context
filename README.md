@@ -1,8 +1,20 @@
 # Agents Shared Context
 
-Coordinate independent OpenCode sessions in the same local project. A second session can see who is working, wait, or continue in parallel. No worktree or terminal integration is required.
+**Run multiple OpenCode sessions in one repo without stepping on each other’s edits.**
 
-Suppose one session is renaming a method and another is updating its tests. Both can edit disjoint files. If the second patch includes a file held by the first, OpenCode denies the **entire patch** before it changes anything. If Redis is down, the edit **continues**, and the agent receives a warning. An existing OpenCode permission denial always wins.
+An OpenCode plugin that lets agents see who’s working, reserve files, and wait for a handoff. No extra worktree or terminal integration required.
+
+[Quick start](#quick-start) · [Session controls](#working-with-other-sessions) · [Privacy and limits](#privacy-and-limits)
+
+![Two OpenCode sessions edit different files in parallel. When Session B’s next patch also touches a file held by Session A, the plugin blocks the entire patch before either file changes.](docs/readme/coordination.svg)
+
+## When it helps
+
+- **Split a change.** One session renames a method while another updates its tests. Both can edit different files. If a supported patch touches a file held by the other session, the plugin blocks the entire patch and names the holder.
+- **Hand off a file.** Check who’s working with `coord_who`. If you need a file another session holds, ask your agent to claim it with `wait: true`. The plugin waits and reserves it when it becomes free; the agent doesn’t have to poll.
+- **Verify the result.** Ask your agent for a stable-source build. The plugin lets tracked work finish, holds new coordinated edits, and releases protection after the foreground build.
+
+**Scope:** This coordinates supported OpenCode operations, not external editors or arbitrary shell writes. If local Redis is unavailable, ordinary edits proceed with a warning, subject to OpenCode permissions.
 
 ## Quick start
 
@@ -30,7 +42,9 @@ Add this entry to `plugins` in `~/.config/opencode/opencode.json`. Replace the e
 }
 ```
 
-OpenCode reloads plugins after config changes; use `/reload` if needed. Ask a session to call `coord_who`. In managed mode the first use creates or starts `agents-shared-context-6390`. Check its binding with `docker port agents-shared-context-6390 6379`.
+OpenCode reloads plugins after config changes; use `/reload` if needed. Open two sessions in the same checkout. Start an edit in one and ask the other to call `coord_who` while the first is still active.
+
+In managed mode the first use creates or starts `agents-shared-context-6390`. Check its binding with `docker port agents-shared-context-6390 6379`.
 
 ## Working with other sessions
 

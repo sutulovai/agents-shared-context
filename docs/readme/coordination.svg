@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="484" viewBox="0 0 960 484" role="img" aria-labelledby="title description">
+  <title id="title">One checkout, two sessions</title>
+  <desc id="description">Session A edits src/api.ts and Session B edits test/api.test.ts in parallel. When Session B submits a patch for both files, the claim on src/api.ts blocks the whole patch before either file changes.</desc>
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0V24" fill="none" stroke="#24334a" stroke-opacity=".42"/>
+    </pattern>
+    <linearGradient id="background" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#142641"/>
+      <stop offset="1" stop-color="#0b1221"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect width="960" height="484" rx="26"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <path fill="url(#background)" d="M0 0h960v484H0z"/>
+    <path fill="url(#grid)" d="M0 0h960v484H0z"/>
+    <rect x=".5" y=".5" width="959" height="483" rx="25.5" fill="none" stroke="#405579"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16" font-weight="700" letter-spacing="1.8">
+    <path d="m39 39 8 8-8 8-8-8z" fill="#76e5c2"/>
+    <text x="59" y="53" fill="#b5c7e2">OPENCODE / SESSION COORDINATION</text>
+  </g>
+  <g font-family="system-ui, -apple-system, sans-serif">
+    <text x="30" y="114" fill="#f4f7ff" font-size="58" font-weight="750" letter-spacing="-2.4">One checkout. Two sessions.</text>
+    <rect x="32" y="148" width="434" height="272" rx="16" fill="#111c30" stroke="#405579"/>
+    <rect x="494" y="148" width="434" height="272" rx="16" fill="#111c30" stroke="#405579"/>
+    <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16" font-weight="700" letter-spacing="1.4">
+      <text x="56" y="183" fill="#76e5c2">01 / DISJOINT EDITS</text>
+      <text x="518" y="183" fill="#ffc392">02 / OVERLAPPING PATCH</text>
+    </g>
+    <g fill="#f4f7ff" font-size="30" font-weight="700" letter-spacing="-.5">
+      <text x="56" y="226">Both edits proceed</text>
+      <text x="518" y="226">Entire patch blocked</text>
+    </g>
+    <g fill="#192b44" stroke="#344968">
+      <rect x="56" y="250" width="386" height="55" rx="8"/>
+      <rect x="56" y="313" width="386" height="55" rx="8"/>
+      <rect x="518" y="250" width="386" height="55" rx="8"/>
+    </g>
+    <rect x="518" y="313" width="386" height="55" rx="8" fill="#322733" stroke="#a36e60"/>
+    <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="20" fill="#f4f7ff">
+      <text x="114" y="285">src/api.ts</text>
+      <text x="114" y="348">test/api.test.ts</text>
+      <text x="576" y="285">src/api.ts</text>
+      <text x="576" y="348">Patch for both files</text>
+    </g>
+    <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15" font-weight="700" text-anchor="middle">
+      <rect x="69" y="264" width="28" height="27" rx="5" fill="#76e5c2"/>
+      <text x="83" y="283" fill="#102b29">A</text>
+      <rect x="69" y="327" width="28" height="27" rx="5" fill="#b5cbff"/>
+      <text x="83" y="346" fill="#172341">B</text>
+      <rect x="531" y="264" width="28" height="27" rx="5" fill="#76e5c2"/>
+      <text x="545" y="283" fill="#102b29">A</text>
+      <rect x="531" y="327" width="28" height="27" rx="5" fill="#b5cbff"/>
+      <text x="545" y="346" fill="#172341">B</text>
+    </g>
+    <g fill="none" stroke="#76e5c2" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m408 278 4 4 8-9m-12 68 4 4 8-9"/>
+    </g>
+    <text x="884" y="283" text-anchor="end" fill="#b5c7e2" font-size="16">Still held by A</text>
+    <g fill="none" stroke="#ffc392" stroke-width="2.5" stroke-linecap="round">
+      <circle cx="876" cy="340.5" r="8"/>
+      <path d="m870.5 346 11-11"/>
+    </g>
+    <g fill="#b5c7e2" font-size="17">
+      <text x="56" y="397">Each session reserves its own file.</text>
+      <text x="518" y="397">Neither file changes in this patch.</text>
+    </g>
+    <path d="M32 443h896" stroke="#405579"/>
+    <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="14" font-weight="700" letter-spacing="1.15">
+      <text x="32" y="466" fill="#76e5c2">LOCAL REDIS LEASES</text>
+      <text x="928" y="466" text-anchor="end" fill="#b5c7e2">SUPPORTED OPENCODE EDITS</text>
+    </g>
+  </g>
+</svg>
